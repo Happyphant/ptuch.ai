@@ -15,6 +15,7 @@ class MockTextGenerationBackend;
 class LlamaBackend;
 class PlainTextEditorAdapter;
 class SuggestionOverlay;
+struct AppSettings;
 
 class MainWindow : public QMainWindow
 {
@@ -41,6 +42,15 @@ private:
     // requestStop (атомарно, из любого потока) + quit/wait llama-потока.
     // Идемпотентно: вызывается из closeEvent и деструктора.
     void stopLlamaWorker();
+    // Диалог настроек (SettingsDialog) -> применение результата.
+    void openSettings();
+    // Применение настроек: параметры генерации — сразу без отмен
+    // (активная генерация продолжается); модельные (путь/n_ctx/GPU) —
+    // только при реальном изменении, безопасным свапом.
+    void applySettings(const AppSettings& settings);
+    // Смена модельных настроек: контроллер -> mock (cancel + bump id),
+    // остановка старого llama-потока, запуск нового с новыми параметрами.
+    void reloadLlamaBackend();
     // Индикатор в верхней панели по состоянию контроллера.
     void updateStateIndicator(SuggestionController::State state);
     void applyStyle();
@@ -51,6 +61,7 @@ private:
     QLabel *m_stateIndicator = nullptr;
     QPushButton *m_generateButton = nullptr;
     QPushButton *m_clearButton = nullptr;
+    QPushButton *m_settingsButton = nullptr;
     QLineEdit *m_textInput = nullptr;
     QComboBox *m_comboBox = nullptr;
 

@@ -59,6 +59,10 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
@@ -191,6 +195,12 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
+        # MainWindow открывает SettingsDialog; тест проверяет применение
+        # настроек через кнопку Settings.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.cpp"
@@ -247,4 +257,37 @@ if(PTUCH_BUILD_TESTS)
     )
 
     add_test(NAME LlamaBackend COMMAND LlamaBackendTests)
+
+    # Тесты настроек: AppSettings (дефолты, сохранение между запусками,
+    # санитизация вышедших за диапазон значений — мусор из QSettings не
+    # доезжает до LlamaBackend) и SettingsDialog (заполнение из
+    # сохранённых значений, жёсткие диапазоны виджетов, отображение
+    # ошибки Test Model без зависания UI; путь к модели — во временном
+    # каталоге, реальная GGUF не грузится).
+    add_executable(SettingsTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/settings_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        # Test Model работает с временным LlamaBackend (свой поток).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+    )
+
+    target_include_directories(SettingsTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(SettingsTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(SettingsTests)
+
+    target_link_libraries(SettingsTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Widgets
+        llama
+    )
+
+    add_test(NAME Settings COMMAND SettingsTests)
 endif()

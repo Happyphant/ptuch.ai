@@ -13,7 +13,7 @@ SuggestionController::SuggestionController(ISuggestionEditor* editor,
     Q_ASSERT(m_editor != nullptr);
 
     m_debounceTimer.setSingleShot(true);
-    m_debounceTimer.setInterval(500); // debounce печати, мс
+    m_debounceTimer.setInterval(m_debounceIntervalMs);
 
     connect(&m_debounceTimer, &QTimer::timeout, this, [this]() {
         // Автозапуск требует фокуса. Если контекст стал непригодным —
@@ -60,6 +60,33 @@ void SuggestionController::setGenerationParams(const QString& systemPrompt,
     m_maxTokens = maxTokens;
     m_temperature = temperature;
     m_topP = topP;
+}
+
+void SuggestionController::setDebounceInterval(int intervalMs)
+{
+    // Запущенный таймер не трогаем: его сброс/перезапуск означал бы
+    // «разрушение» debounce в полёте. Новое значение подхватит
+    // следующий scheduleRequest().
+    m_debounceIntervalMs = qBound(0, intervalMs, 60000);
+}
+
+void SuggestionController::setAutoSuggestions(bool enabled)
+{
+    if (m_autoSuggestions == enabled)
+        return;
+
+    m_autoSuggestions = enabled;
+
+    if (m_autoSuggestions)
+        return;
+
+    // Хвост debounce гасим — автозапуска не будет. Активный запрос
+    // (ручной или уже стартовавший) и показанная подсказка НЕ
+    // отменяются: обновление настроек не разрушает текущую генерацию.
+    if (m_state == State::Debouncing) {
+        m_debounceTimer.stop();
+        setState(State::Idle);
+    }
 }
 
 void SuggestionController::setStyleMix(QVector<StyleWeight> mix)
@@ -127,7 +154,10 @@ void SuggestionController::scheduleRequest()
 {
     m_debounceTimer.stop();
 
+    // !m_autoSuggestions — гейт автоматических подсказок: ручной
+    // requestSuggestion/requestAlternative этот путь не проходят.
     if (!m_enabled ||
+        !m_autoSuggestions ||
         !m_editor->hasFocus() ||
         m_editor->isReadOnly()) {
         setState(State::Idle);
@@ -142,6 +172,9 @@ void SuggestionController::scheduleRequest()
         return;
     }
 
+    // Интервал применяется здесь (а не в сеттере), чтобы не трогать
+    // уже запущенный таймер: настройки меняются «на лету» безопасно.
+    m_debounceTimer.setInterval(m_debounceIntervalMs);
     m_debounceTimer.start();
     setState(State::Debouncing);
 }

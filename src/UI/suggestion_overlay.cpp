@@ -13,6 +13,23 @@
 namespace {
 // Альфа ghost-текста: заметно полупрозрачный, но читаемый.
 constexpr int kGhostAlpha = 112; // ~44%
+
+// Длина префикса text, помещающегося в maxWidth: ширина префикса
+// монотонна по длине — бинарный поиск по индексам символов.
+int fittedPrefixLength(const QFontMetrics& fm, const QString& text,
+                       int maxWidth)
+{
+    int lo = 0;
+    int hi = text.size();
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (fm.horizontalAdvance(text.left(mid)) <= maxWidth)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return lo;
+}
 } // namespace
 
 SuggestionOverlay::SuggestionOverlay(QPlainTextEdit* editor)
@@ -86,19 +103,68 @@ void SuggestionOverlay::paintEvent(QPaintEvent* event)
     // Курсор в координатах viewport (overlay заполняет viewport целиком).
     const QRect caret = m_editor->cursorRect();
     const int margin = qRound(m_editor->document()->documentMargin());
-    const QStringList lines = m_suggestion.split(QLatin1Char('\n'));
+    // Правая граница текстовой области: подсказка не должна уезжать
+    // за правый край экрана — всё, что не влезает, переносится вниз.
+    const int right = width() - margin;
+    const qreal lineStep = fm.lineSpacing();
 
-    for (int i = 0; i < lines.size(); ++i) {
-        // Первая строка — сразу за курсором; последующие — по левому
-        // краю текстовой области (как в Copilot-подобных редакторах).
-        const int x = (i == 0) ? caret.left() : margin;
-        const qreal w = qreal(width()) - x;
-        if (w <= 0.0)
-            continue; // курсор уехал за правый край — рисовать некуда
+    const auto drawRow = [&](const QString& text, qreal rowX,
+                             qreal rowY) {
+        painter.drawText(QRectF(QPointF(rowX, rowY),
+                                QSizeF(right - rowX, fm.height())),
+                         Qt::AlignLeft | Qt::AlignTop, text);
+    };
 
-        const qreal y = caret.top() + i * qreal(fm.lineSpacing());
-        painter.drawText(QRectF(QPointF(x, y), QSizeF(w, fm.height())),
-                         Qt::AlignLeft | Qt::AlignTop, lines[i]);
+    // Первая строка — сразу за курсором; каждая следующая (в т.ч.
+    // продолжение перенесённой) — по левому краю текстовой области
+    // (как в Copilot-подобных редакторах). Длинная подсказка ломается
+    // на строки по пробелам (слово длиннее строки — жёстко), поэтому
+    // текст всегда остаётся во viewport, а не обрезается у края.
+    qreal y = caret.top();
+    int x = caret.left();
+
+    const QStringList paragraphs =
+        m_suggestion.split(QLatin1Char('\n'));
+    for (const QString& paragraph : paragraphs) {
+        QString remaining = paragraph;
+        while (true) {
+            const int available = right - x;
+            if (available <= 0) {
+                // Места в строке нет (курсор у правого края) —
+                // продолжение уводим ниже, к левому краю.
+                x = margin;
+                y += lineStep;
+                if (right - x <= 0)
+                    return; // во viewport нет места совсем
+                continue;
+            }
+
+            if (fm.horizontalAdvance(remaining) <= available) {
+                drawRow(remaining, x, y);
+                break;
+            }
+
+            // Не влезает целиком: отрезаем кусок до места разрыва —
+            // по последнему пробелу, иначе жёстко по символу.
+            int cut = fittedPrefixLength(fm, remaining, available);
+            const int space =
+                remaining.lastIndexOf(QLatin1Char(' '), cut);
+            if (space > 0)
+                cut = space;
+            if (cut <= 0)
+                cut = 1; // гарантия прогресса: символ шире остатка
+
+            drawRow(remaining.left(cut), x, y);
+            remaining = remaining.mid(cut);
+            while (remaining.startsWith(QLatin1Char(' ')))
+                remaining.remove(0, 1); // пробел разрыва не рисуем
+
+            x = margin;
+            y += lineStep;
+        }
+        // Следующий абзац (после '\n') начинается с новой строки.
+        x = margin;
+        y += lineStep;
     }
 }
 

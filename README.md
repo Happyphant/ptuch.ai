@@ -25,8 +25,9 @@ Qt 6 desktop-текстовый редактор с AI-подсказками (M
   - debounce 500 мс после паузы в наборе;
   - **ghost-подсказка** рисуется `SuggestionOverlay` поверх viewport'а
     редактора: полупрозрачный текст у курсора (первая строка — сразу за
-    курсором, последующие — по левому краю), документ при этом не
-    меняется до принятия;
+    курсором, последующие — по левому краю; длинный текст переносится
+    по ширине viewport и **не выезжает за правый край экрана**),
+    документ при этом не меняется до принятия;
   - **Tab** — принять подсказку (`acceptSuggestion`), **Shift+Tab** —
     альтернатива, **Escape** — отклонить и отменить запрос
     (`rejectSuggestion`); перевод клавиш — в `MainWindow::eventFilter`,
@@ -66,6 +67,33 @@ Qt 6 desktop-текстовый редактор с AI-подсказками (M
   - логирование категорией `ptuch.llama`: путь и время загрузки,
     `n_ctx`/потоки, число токенов промпта, время prompt processing,
     время генерации, причина остановки, поток выполнения.
+- **Диалог настроек** — `SettingsDialog` (кнопка **Settings** в панели,
+  хранение `QSettings`, ключи/дефолты/диапазоны — `AppSettings`):
+  - поля: путь к GGUF-модели (кнопка выбора файла `…`, пусто —
+    авто-поиск как при старте), размер контекста, максимум новых
+    токенов, temperature, top-p, число GPU-слоёв (−1 = «все слои»),
+    интервал debounce и переключатель автоматических подсказок;
+  - **проверка диапазонов**: `QSpinBox`/`QDoubleSpinBox` ограничены
+    диапазонами `AppSettings`, а `AppSettings::load()` дополнительно
+    санирует правленый руками файл настроек — некорректное значение
+    не доедет ни до контроллера, ни до `LlamaBackend`
+    (защита в глубину, см. `app_settings.h`);
+  - кнопка **Test Model**: загрузка GGUF на **временном** `LlamaBackend`
+    в собственном потоке (приложение продолжает генерировать на своём
+    backend'е — активная генерация не отменяется и модель не
+    перезагружается); прогресс/успех/ошибка загрузки показываются
+    цветной меткой рядом с кнопкой, поток останавливается
+    `requestStop → quit → wait` (в т.ч. в деструкторе диалога);
+  - настройки сохраняются между запусками (`save()` + `sync()`);
+  - **обновление не разрушает активную генерацию**: параметры
+    генерации/debounce/авто применяются сразу (контроллер копирует их
+    в каждый новый запрос, запущенный debounce-таймер не сбрасывается,
+    выключение авто не отменяет запрос «в полёте» и не блокирует
+    ручной `requestSuggestion`); перезагрузка модели
+    (`MainWindow::reloadLlamaBackend`) — только при реальном
+    изменении пути/контекста/GPU-слоёв и безопасным свапом
+    (контроллер → mock: cancel + bump id → остановка старого потока →
+    новый backend с новыми настройками, пока он грузится — mock).
 
 ## Структура
 
@@ -76,8 +104,14 @@ src/
                                 # потоки backend'ов заводит MainWindow
   UI/
     MainWindow.h / .cpp         # central QPlainTextEdit, toolbar, статусная строка, wiring
-                                # (mock + llama: setupLlamaBackend/stopLlamaWorker)
+                                # (mock + llama: setupLlamaBackend/stopLlamaWorker;
+                                #  настройки: openSettings/applySettings/reloadLlamaBackend)
     suggestion_overlay.h / .cpp # ghost-подсказка поверх viewport'а (документ не трогает)
+    settings_dialog.h / .cpp    # SettingsDialog: поля с диапазонами, выбор файла,
+                                # Test Model на временном LlamaBackend (свой поток)
+  settings/
+    app_settings.h / .cpp       # AppSettings: единый источник ключей/дефолтов/диапазонов
+                                # QSettings + sanitize() (защита от мусора)
   llama/
     llama_backend.h / .cpp      # LlamaBackend: ITextGenerationBackend поверх llama.cpp
                                 # (pimpl, worker-поток, RAII, отмена, логи ptuch.llama)
@@ -97,6 +131,8 @@ tests/
   ghost_suggestion_test.cpp    # Qt Test: overlay (пиксели) + клавиши Tab/Escape
                                # + жизненный цикл MainWindow с реальной моделью
   llama_backend_test.cpp       # Qt Test: контракт LlamaBackend + smoke с GGUF
+  settings_test.cpp            # Qt Test: AppSettings (дефолты/roundtrip/санитизация)
+                               # + SettingsDialog (диапазоны, ошибка Test Model)
 models/                         # *.gguf (в .gitignore)
 third_party/
   llama.cpp/                    # вендор (не редактируется)
@@ -131,6 +167,7 @@ ctest --test-dir build --output-on-failure
 ./build/MockTextGenerationBackendTests
 ./build/GhostSuggestionTests
 ./build/LlamaBackendTests
+./build/SettingsTests
 ```
 
 Медленные проверки с реальной моделью (2 ГБ GGUF в `models/`) в `ctest`
@@ -139,6 +176,7 @@ ctest --test-dir build --output-on-failure
 ```bash
 PTUCH_MODEL_TESTS=1 ./build/LlamaBackendTests          # smoke: загрузка, генерация, отмена
 PTUCH_MODEL_TESTS=1 ./build/GhostSuggestionTests        # + жизненный цикл MainWindow с моделью
+PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диалоге с реальной GGUF
 ```
 
 Покрытие:
@@ -151,8 +189,14 @@ PTUCH_MODEL_TESTS=1 ./build/GhostSuggestionTests        # + жизненный �
   запросов, после паузы ровно один), пустой контекст без генерации,
   мгновенный ручной `requestSuggestion` (и параметры запроса), рост
   generation id, игнорирование устаревшего ответа, отмена по
-  `rejectSuggestion`, ошибки backend'а, `acceptSuggestion`, `setStyleMix`.
-  Тесты идут без виджетов — только через интерфейсы.
+  `rejectSuggestion`, ошибки backend'а, `acceptSuggestion`, `setStyleMix`;
+  обновление настроек «на лету»: `setDebounceInterval` (кламп
+  границами, новый интервал применяется к следующему таймеру),
+  `setAutoSuggestions` (гейт только debounce-пути: хвост таймера
+  гаснет, ручной запрос и активная генерация живут) и
+  `setGenerationParams` посреди активной генерации (запрос не
+  отменяется, завершается со своим id, новые параметры уходят в
+  следующий запрос). Тесты идут без виджетов — только через интерфейсы.
 - `MockTextGenerationBackend` — работа в отдельном потоке (не в
   UI-потоке), задержка и `elapsedMs`, явный `requestId` у конкурентных
   запросов, имитация ошибки, отмена запроса (честный режим и режим
@@ -164,7 +208,10 @@ PTUCH_MODEL_TESTS=1 ./build/GhostSuggestionTests        # + жизненный �
   сценарий клавиш в `MainWindow`: печать → подсказка, **Tab** принимает
   (текст в документе), Tab без подсказки проходит в редактор (вставляется
   `\t`), ввод символа и движение курсора чистят подсказку, **Escape**
-  отклоняет без изменения документа. Отдельный слот
+  отклоняет без изменения документа. Слот
+  `settingsDialogAppliesAndPersists` открывает диалог кнопкой
+  **Settings**, меняет debounce/авто и проверяет: контроллер получил
+  новые значения, `QSettings` сохранил их. Отдельный слот
   `mainWindowLoadsRealModelAndClosesCleanly` (под `PTUCH_MODEL_TESTS=1`)
   грузит реальную GGUF через `MainWindow` и закрывает окно — проверка
   `closeEvent → stopLlamaWorker → RAII`-освобождения.
@@ -176,6 +223,18 @@ PTUCH_MODEL_TESTS=1 ./build/GhostSuggestionTests        # + жизненный �
   (проверка потока исполнения сигналом), генерация (непустой текст,
   `elapsedMs`, допустимые `stopReason`), идемпотентный повтор
   `loadModel()`, отмена → `stopReason="cancelled"`.
+- `Settings` — дефолты при пустом `QSettings`, roundtrip
+  «сохранил → новый запуск → загрузил» (в т.ч. ключ `llama/modelPath`
+  находит `resolveModelPath()`), санитизация вышедших за диапазон и
+  нечисловых значений (`load()` возвращает валидные значения),
+  заполнение `SettingsDialog` из сохранённых настроек, жёсткие
+  диапазоны виджетов (кламп при `setValue`), `settings()` в границах,
+  ошибка Test Model: несуществующий файл (мгновенно, без потока) и
+  битый GGUF (асинхронная ошибка из тест-потока, UI не зависает).
+  Тесты снимают и возвращают только ключи приложения (`llama/*`,
+  `suggestion/*`) — чужие ключи файла (fallback `NSGlobalDomain`)
+  не затираются и не копируются. Под `PTUCH_MODEL_TESTS=1` — Test Model
+  с реальной моделью до состояния `OK:`.
 
 Снимок ghost-подсказки для ручного просмотра (по желанию):
 
@@ -227,6 +286,31 @@ open build/PtuchEditor.app
 ```bash
 ./build/PtuchEditor.app/Contents/MacOS/PtuchEditor 2>&1 | grep ptuch.llama
 ```
+
+### Настройки (QSettings)
+
+Кнопка **Settings** в верхней панели открывает `SettingsDialog`; OK
+применяет и сохраняет значения (единый источник — `AppSettings`,
+`src/settings/app_settings.h`):
+
+| Ключ | Дефолт | Диапазон |
+| --- | --- | --- |
+| `llama/modelPath` | пусто (авто-поиск) | — |
+| `llama/contextSize` | 4096 | 256..8192 |
+| `llama/maxTokens` | 64 | 1..512 |
+| `llama/temperature` | 0.7 | 0.1..2.0 |
+| `llama/topP` | 0.9 | 0.1..1.0 |
+| `llama/gpuLayers` | −1 (все слои) | −1..128 |
+| `suggestion/debounceMs` | 500 | 50..10000 |
+| `suggestion/autoSuggestions` | включено | bool |
+
+- Значения вне диапазона (в т.ч. правленый руками файл) обрезаются в
+  `AppSettings::load()` — до `LlamaBackend`/контроллера доезжают
+  только валидные значения.
+- Путь/n_ctx/GPU-слои применяются перезагрузкой модели **только при
+  изменении** (безопасным свапом, активная генерация корректно
+  завершается как устаревшая); остальные параметры — сразу, без
+  отмены запроса.
 
 ## Стандарт и автогенерация Qt
 

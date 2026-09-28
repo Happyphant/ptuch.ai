@@ -2,6 +2,8 @@
 
 #include "backend/mock_text_generation_backend.h"
 #include "llama/llama_backend.h"
+#include "settings/app_settings.h"
+#include "settings_dialog.h"
 #include "suggestion/editor_adapter.h"
 #include "suggestion/suggestion_controller.h"
 #include "suggestion_overlay.h"
@@ -89,6 +91,10 @@ void MainWindow::createStatusPanel()
     m_clearButton->setObjectName("clearButton");
     bar->addWidget(m_clearButton);
 
+    m_settingsButton = new QPushButton(tr("Settings"), bar);
+    m_settingsButton->setObjectName("settingsButton");
+    bar->addWidget(m_settingsButton);
+
     bar->addSeparator();
 
     // Растягивающийся вставкой блок: line edit прижимается вправо.
@@ -135,6 +141,16 @@ void MainWindow::setupController()
     // тот же setBackend() с другим объектом ITextGenerationBackend.
     m_controller->setBackend(m_generationBackend);
 
+    // Настройки из QSettings — до первого запроса. Значения
+    // санированы в AppSettings::load(), контроллер дополнительно
+    // клампит debounce-интервал.
+    const AppSettings appSettings = AppSettings::load();
+    m_controller->setDebounceInterval(appSettings.debounceMs);
+    m_controller->setAutoSuggestions(appSettings.autoSuggestions);
+    m_controller->setGenerationParams(
+        /*systemPrompt*/ QString(), appSettings.maxTokens,
+        appSettings.temperature, appSettings.topP);
+
     // Редактор -> контроллер
     connect(m_editor, &QPlainTextEdit::textChanged,
             m_controller, &SuggestionController::onTextChanged);
@@ -146,6 +162,10 @@ void MainWindow::setupController()
             m_controller, &SuggestionController::requestSuggestion);
     connect(m_clearButton, &QPushButton::clicked,
             m_controller, &SuggestionController::rejectSuggestion);
+
+    // Настройки -> диалог -> applySettings (см. openSettings).
+    connect(m_settingsButton, &QPushButton::clicked,
+            this, &MainWindow::openSettings);
 
     // Контроллер -> индикатор состояния (сам контроллер виджетов не знает)
     connect(m_controller, &SuggestionController::stateChanged,
@@ -208,10 +228,11 @@ void MainWindow::setupLlamaBackend()
     connect(m_llamaThread, &QThread::finished,
             m_llamaBackend, &QObject::deleteLater);
 
-    // Конфигурация ДО queued-вызова loadModel: путь из настроек/поиска,
-    // контекст ограничен, все слои на GPU (Metal).
-    m_llamaBackend->configure(modelPath, /*contextSize*/ 4096,
-                              /*gpuLayers*/ -1);
+    // Конфигурация ДО старта потока: путь из настроек/поиска; n_ctx и
+    // GPU-слои — из AppSettings (санированы при загрузке).
+    const AppSettings appSettings = AppSettings::load();
+    m_llamaBackend->configure(modelPath, appSettings.contextSize,
+                              appSettings.gpuLayers);
 
     // Связи — до старта потока, чтобы не пропустить сигналы загрузки.
     connect(m_llamaBackend, &LlamaBackend::progressChanged,
@@ -265,6 +286,73 @@ void MainWindow::stopLlamaWorker()
         // обнуляем, чтобы повторный вызов (деструктор) был безопасным.
         m_llamaBackend = nullptr;
     }
+}
+
+void MainWindow::openSettings()
+{
+    // exec() пускает вложенный event loop: диалог модален, приложение
+    // при этом продолжает работать (debounce/mock-поток не висят).
+    SettingsDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    applySettings(dialog.settings());
+}
+
+void MainWindow::applySettings(const AppSettings& settings)
+{
+    const AppSettings previous = AppSettings::load();
+    // save() санирует перед записью; переживает перезапуск (sync).
+    settings.save();
+
+    // 1) Настройки, не влияющие на модель, — сразу и без отмен:
+    //    контроллер копирует параметры в КАЖДЫЙ новый запрос, поэтому
+    //    активная генерация продолжает идти со старыми значениями и
+    //    завершается штатно; debounce-таймер «в полёте» не сбрасывается.
+    if (m_controller != nullptr) {
+        m_controller->setDebounceInterval(settings.debounceMs);
+        m_controller->setAutoSuggestions(settings.autoSuggestions);
+        m_controller->setGenerationParams(
+            /*systemPrompt*/ QString(), settings.maxTokens,
+            settings.temperature, settings.topP);
+    }
+
+    // 2) Путь/n_ctx/GPU-слои фиксируются при создании llama_context:
+    //    перезагрузка нужна ТОЛЬКО при их реальном изменении. Если
+    //    менялись только параметры генерации/debounce — активная
+    //    генерация не затрагивается вовсе.
+    const bool modelAffectingChanged =
+        previous.modelPath != settings.modelPath ||
+        previous.contextSize != settings.contextSize ||
+        previous.gpuLayers != settings.gpuLayers;
+
+    if (modelAffectingChanged)
+        reloadLlamaBackend();
+}
+
+void MainWindow::reloadLlamaBackend()
+{
+    // llama отключён окружением — перезагружать нечего (mock работает).
+    if (qEnvironmentVariableIsSet("PTUCH_DISABLE_LLAMA"))
+        return;
+
+    // Безопасный свап: никогда не освобождаем llama_context «под»
+    // decode. Порядок:
+    //  1) контроллер первым переходит на mock — cancel + bump id
+    //     корректно завершают активный запрос как устаревший, сигналы
+    //     старого backend'а отвязаны (опоздавший modelLoaded не
+    //     переподключится);
+    //  2) старый поток гаснет: requestStop атомарно прерывает
+    //     загрузку/декод, wait() дожидается выхода из llama-циклов ДО
+    //     освобождения объекта (RAII в потоке) — use-after-free
+    //     исключён;
+    //  3) новый backend стартует со свежими настройками. Пока модель
+    //     грузится, подсказки отдаёт mock — UI не блокируется.
+    if (m_controller != nullptr && m_generationBackend != nullptr)
+        m_controller->setBackend(m_generationBackend);
+
+    stopLlamaWorker();
+    setupLlamaBackend();
 }
 
 void MainWindow::updateStateIndicator(SuggestionController::State state)

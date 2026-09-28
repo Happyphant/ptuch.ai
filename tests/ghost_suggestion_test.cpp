@@ -2,19 +2,35 @@
 #include <QtTest>
 
 #include "UI/MainWindow.h"
+#include "UI/settings_dialog.h"
 #include "UI/suggestion_overlay.h"
 #include "llama/llama_backend.h"
+#include "settings/app_settings.h"
 #include "suggestion/suggestion_controller.h"
 
+#include <QCheckBox>
 #include <QFontMetrics>
 #include <QImage>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QPixmap>
+#include <QSettings>
+#include <QSpinBox>
 #include <QStatusBar>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTimer>
 
 namespace {
+
+// Только ключи нашего приложения: QSettings::allKeys() включает и
+// fallback (NSGlobalDomain) — чужие ключи нельзя затирать или
+// копировать в файл настроек PtuchEditor.
+bool isOurSettingsKey(const QString& key)
+{
+    return key.startsWith(QLatin1String("llama/")) ||
+           key.startsWith(QLatin1String("suggestion/"));
+}
 
 // Результат сканирования прямоугольника рендера overlay:
 // найденные пиксели ghost-текста (alpha > kGhostPixelThreshold).
@@ -81,7 +97,9 @@ void prepareEditor(QPlainTextEdit& editor)
 //  1) overlay рисует полупрозрачный текст у курсора, НЕ меняя документ;
 //  2) overlay не перехватывает мышь/фокус;
 //  3) многострочные подсказки рисуются корректно;
-//  4) сценарий клавиш в MainWindow: Tab принимает, Escape отклоняет,
+//  4) длинная подсказка переносится во viewport, а не уезжает
+//     за правый край;
+//  5) сценарий клавиш в MainWindow: Tab принимает, Escape отклоняет,
 //     Tab без подсказки не перехватывается, ввод/движение курсора чистят
 //     подсказку.
 // ---------------------------------------------------------------------------
@@ -91,11 +109,19 @@ class GhostSuggestionTest : public QObject
 
 private slots:
     void initTestCase();
+    void cleanupTestCase();
     void overlayRendersGhostWithoutTouchingDocument();
     void overlayIgnoresMouseAndFocus();
     void overlaySupportsMultilineSuggestion();
+    void overlayWrapsLongSuggestionToViewport();
     void keysScenario();
+    void settingsDialogAppliesAndPersists();
     void mainWindowLoadsRealModelAndClosesCleanly();
+
+private:
+    // Пользовательские настройки: полный снимок файла QSettings
+    // (снимок в initTestCase, дословный возврат в cleanupTestCase).
+    QVariantMap m_original;
 };
 
 void GhostSuggestionTest::initTestCase()
@@ -103,6 +129,47 @@ void GhostSuggestionTest::initTestCase()
     // UI-тесты работают на mock-бэкенде: реальный GGUF (2 ГБ) в
     // MainWindow не загружаем — иначе каждый тест тянул бы модель.
     qputenv("PTUCH_DISABLE_LLAMA", "1");
+
+    // Снимок ВСЕХ пользовательских настроек: тесты пишут в тот же
+    // файл QSettings (PtuchAI/PtuchEditor) — в т.ч. через
+    // applySettings (ключи llama/*), cleanupTestCase вернёт файл
+    // дословно.
+    //
+    // Только ключи НАШЕГО приложения: allKeys() включает и fallback
+    // (NSGlobalDomain) — их нельзя ни затирать, ни копировать в наш
+    // файл настроек.
+    QSettings settings(QStringLiteral("PtuchAI"),
+                       QStringLiteral("PtuchEditor"));
+    const QStringList keys = settings.allKeys();
+    for (const QString& key : keys) {
+        if (!isOurSettingsKey(key))
+            continue;
+        m_original.insert(key, settings.value(key));
+        settings.remove(key);
+    }
+
+    // Настройки подсказок принудительно дефолтные: тайминги тестов
+    // (500 мс debounce, авто-подсказки включены) не должны зависеть
+    // от пользовательского QSettings.
+    settings.setValue(AppSettings::keyDebounceMs, 500);
+    settings.setValue(AppSettings::keyAutoSuggestions, true);
+    settings.sync();
+}
+
+void GhostSuggestionTest::cleanupTestCase()
+{
+    // Возврат дословно только НАШИХ ключей (см. initTestCase).
+    QSettings settings(QStringLiteral("PtuchAI"),
+                       QStringLiteral("PtuchEditor"));
+    const QStringList keys = settings.allKeys();
+    for (const QString& key : keys) {
+        if (isOurSettingsKey(key))
+            settings.remove(key);
+    }
+    for (auto it = m_original.cbegin(); it != m_original.cend(); ++it)
+        settings.setValue(it.key(), it.value());
+    settings.sync();
+    m_original.clear();
 }
 
 void GhostSuggestionTest::overlayRendersGhostWithoutTouchingDocument()
@@ -208,6 +275,51 @@ void GhostSuggestionTest::overlaySupportsMultilineSuggestion()
     QCOMPARE(editor.toPlainText(), QStringLiteral("hello"));
 }
 
+void GhostSuggestionTest::overlayWrapsLongSuggestionToViewport()
+{
+    QPlainTextEdit editor;
+    prepareEditor(editor); // 400×200, курсор в конце строки
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+
+    SuggestionOverlay overlay(&editor);
+    // Длинная подсказка без '\n': раньше она рисовалась одной строкой
+    // от курсора и уезжала за правый край экрана (обрезалась
+    // viewport'ом) — теперь должна перенестись вниз.
+    overlay.setSuggestion(QStringLiteral(
+        " very long suggestion text that certainly does not fit into "
+        "the narrow editor viewport and must be wrapped into several "
+        "visual lines without running off the right screen edge"));
+    QVERIFY(overlay.isVisible());
+
+    // Документ не тронут ghost-подсказкой.
+    QCOMPARE(editor.toPlainText(), QStringLiteral("hello"));
+
+    const QPixmap rendered = renderOverlay(overlay);
+    const QRect caret = editor.cursorRect();
+    const int margin = qRound(editor.document()->documentMargin());
+    const int lineStep = QFontMetrics(editor.font()).lineSpacing();
+
+    // Продолжение перенесённой строки — у левого края текстовой
+    // области, ниже строки курсора (зона строго левее курсора:
+    // glyphs первой строки туда не заглядывают). У старого кода
+    // (одна строка от курсора) этой строки не было вовсе.
+    const int zoneWidth = qMax(1, caret.left() - margin);
+    const GhostBounds continuation = scanRegion(
+        rendered, QRect(QPoint(margin - 2, caret.top() + lineStep),
+                        QSize(zoneWidth, lineStep)));
+    QVERIFY2(continuation.found,
+             "Длинная подсказка не перенесена во вторую строку");
+    QVERIFY(continuation.left <= margin + 4);
+
+    // Первая строка рисуется от курсора, а не прижата к левому краю.
+    const GhostBounds firstLine = scanRegion(
+        rendered, QRect(QPoint(caret.left() - 1, caret.top() - 1),
+                        QSize(200, lineStep)));
+    QVERIFY2(firstLine.found, "Первая строка ghost не нарисована");
+
+    QCOMPARE(editor.toPlainText(), QStringLiteral("hello"));
+}
+
 void GhostSuggestionTest::keysScenario()
 {
     MainWindow window;
@@ -282,6 +394,61 @@ void GhostSuggestionTest::keysScenario()
     editor->setTextCursor(cursor);
     QVERIFY(!controller->hasSuggestion());
     QVERIFY(!overlay->isVisible());
+}
+
+// Кнопка Settings в панели -> диалог -> применение настроек: контроллер
+// получает новые значения сразу, QSettings сохраняет их (переживут
+// перезапуск). Модельные настройки не менялись — llama-поток и активная
+// генерация не затрагиваются.
+void GhostSuggestionTest::settingsDialogAppliesAndPersists()
+{
+    MainWindow window;
+
+    auto* settingsButton = window.findChild<QPushButton*>(
+        QStringLiteral("settingsButton"));
+    QVERIFY2(settingsButton, "Кнопка Settings не создана");
+
+    bool dialogTouched = false;
+    // click() -> openSettings() -> dialog.exec() (вложенный event
+    // loop): таймер срабатывает внутри exec и закрывает диалог.
+    QTimer::singleShot(0, &window, [&]() {
+        auto* dialog = window.findChild<SettingsDialog*>(
+            QStringLiteral("settingsDialog"));
+        if (dialog == nullptr)
+            return;
+        auto* debounce = dialog->findChild<QSpinBox*>(
+            QStringLiteral("debounceEdit"));
+        auto* autoCheck = dialog->findChild<QCheckBox*>(
+            QStringLiteral("autoSuggestionsCheck"));
+        if (debounce == nullptr || autoCheck == nullptr)
+            return;
+        debounce->setValue(750);
+        autoCheck->setChecked(false);
+        dialogTouched = true;
+        dialog->accept();
+    });
+
+    settingsButton->click(); // модальный exec до accept()
+    QVERIFY2(dialogTouched, "Диалог настроек не открылся");
+
+    // Применено контроллеру — сразу, без пересоздания backend'а.
+    auto* controller = window.findChild<SuggestionController*>();
+    QVERIFY(controller);
+    QCOMPARE(controller->debounceInterval(), 750);
+    QCOMPARE(controller->autoSuggestions(), false);
+
+    // И сохранено в QSettings — переживёт перезапуск приложения.
+    const AppSettings loaded = AppSettings::load();
+    QCOMPARE(loaded.debounceMs, 750);
+    QCOMPARE(loaded.autoSuggestions, false);
+
+    // Дефолты обратно: последующие тесты не зависят от порядка
+    // (cleanupTestCase вернёт пользовательские значения).
+    QSettings settings(QStringLiteral("PtuchAI"),
+                       QStringLiteral("PtuchEditor"));
+    settings.setValue(AppSettings::keyDebounceMs, 500);
+    settings.setValue(AppSettings::keyAutoSuggestions, true);
+    settings.sync();
 }
 
 void GhostSuggestionTest::mainWindowLoadsRealModelAndClosesCleanly()

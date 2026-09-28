@@ -3,6 +3,7 @@
 
 #include "suggestion/suggestion_controller.h"
 
+#include <QElapsedTimer>
 #include <QTextDocument>
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,9 @@ private slots:
     void backendErrorEmitsSuggestionFailed();
     void acceptSuggestionInsertsText();
     void styleMixClearsSuggestion();
+    void debounceIntervalApplies(); // setDebounceInterval: кламп + тайминг
+    void autoSuggestionsGateKeepsManualAndActive();
+    void settingsUpdateDuringGenerationKeepsRequest();
 
 private:
     bool waitForRequests(int n)
@@ -395,6 +399,98 @@ void SuggestionControllerTest::styleMixClearsSuggestion()
     QCOMPARE(backend->requests[1].styleWeights.size(), 1);
     QCOMPARE(backend->requests[1].styleWeights.first().styleId,
              QStringLiteral("poetic"));
+}
+
+// setDebounceInterval: значение применяется к следующему запуску
+// таймера (запущенный не перезапускается) и клампится границами.
+void SuggestionControllerTest::debounceIntervalApplies()
+{
+    QCOMPARE(controller->debounceInterval(), 500);
+
+    controller->setDebounceInterval(50);
+    QCOMPARE(controller->debounceInterval(), 50);
+
+    // Сеттер санирует сам: за границами [0; 60000] не уходит.
+    controller->setDebounceInterval(-10);
+    QCOMPARE(controller->debounceInterval(), 0);
+    controller->setDebounceInterval(999999);
+    QCOMPARE(controller->debounceInterval(), 60000);
+
+    controller->setDebounceInterval(50);
+
+    // С новым интервалом запрос уходит заметно раньше старых 500 мс.
+    QElapsedTimer timer;
+    timer.start();
+    editor->typeText(QStringLiteral("hello"));
+    QVERIFY(waitForRequests(1));
+    QVERIFY2(timer.elapsed() < 450,
+             "Debounce должен использоваться новый (50 мс), а не 500");
+}
+
+// Выключение автоматических подсказок гасит debounce-путь, но НЕ
+// ручной запрос и НЕ активную генерацию.
+void SuggestionControllerTest::autoSuggestionsGateKeepsManualAndActive()
+{
+    // Хвост debounce «в полёте» гаснет при выключении авто.
+    editor->typeText(QStringLiteral("hello"));
+    QCOMPARE(controller->state(), State::Debouncing);
+
+    controller->setAutoSuggestions(false);
+    QCOMPARE(controller->state(), State::Idle);
+    QTest::qWait(700);
+    QCOMPARE(backend->count(), 0);
+
+    // Печать при выключенном авто не порождает запросов...
+    editor->typeText(QStringLiteral("hello world"));
+    QTest::qWait(700);
+    QCOMPARE(backend->count(), 0);
+    QCOMPARE(controller->state(), State::Idle);
+
+    // ...но ручной запрос работает.
+    controller->requestSuggestion();
+    QCOMPARE(backend->count(), 1);
+    QCOMPARE(controller->state(), State::Generating);
+
+    // Включение авто возвращает debounce-путь.
+    controller->setAutoSuggestions(true);
+    QVERIFY(controller->autoSuggestions());
+    editor->typeText(QStringLiteral("hello world!"));
+    QVERIFY(waitForRequests(2));
+}
+
+// Обновление настроек посреди активной генерации: запрос не отменяется
+// и не перезапускается, завершается со своим id; новые параметры
+// применяются к СЛЕДУЮЩЕМУ запросу.
+void SuggestionControllerTest::settingsUpdateDuringGenerationKeepsRequest()
+{
+    editor->typeText(QStringLiteral("hello"));
+    QVERIFY(waitForRequests(1));
+    const quint64 id = backend->requests[0].requestId;
+    QCOMPARE(controller->state(), State::Generating);
+
+    controller->setDebounceInterval(750);
+    controller->setGenerationParams(QString(), 128, 0.9, 0.95);
+    controller->setAutoSuggestions(false);
+
+    // Ни отмены, ни нового запроса, ни смены состояния.
+    QCOMPARE(backend->count(), 1);
+    QVERIFY(backend->cancelled.isEmpty());
+    QCOMPARE(controller->state(), State::Generating);
+
+    // Активная генерация доходит до конца со СВОИМ generation id.
+    backend->respond(0, QStringLiteral("alive"));
+    QCOMPARE(readySpy->count(), 1);
+    QCOMPARE(readySpy->at(0).at(1).toULongLong(), id);
+    QCOMPARE(controller->state(), State::Ready);
+    QCOMPARE(controller->suggestion(), QStringLiteral("alive"));
+
+    // Следующий запрос (ручной — авто выключены) несёт НОВЫЕ параметры.
+    controller->requestSuggestion();
+    QCOMPARE(backend->count(), 2);
+    const GenerationRequest& second = backend->requests[1];
+    QCOMPARE(second.maxTokens, 128);
+    QCOMPARE(second.temperature, 0.9);
+    QCOMPARE(second.topP, 0.95);
 }
 
 QTEST_GUILESS_MAIN(SuggestionControllerTest)

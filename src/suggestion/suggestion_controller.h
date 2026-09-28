@@ -92,6 +92,20 @@ public:
                              double temperature,
                              double topP);
 
+    // Интервал debounce, мс (санитизация — [0; 60000]). Запущенный
+    // таймер не перезапускается: новое значение подхватит следующий
+    // scheduleRequest() — обновление настроек посреди печати или
+    // активной генерации ничего не сбрасывает.
+    void setDebounceInterval(int intervalMs);
+    int debounceInterval() const { return m_debounceIntervalMs; }
+
+    // Автоматические подсказки — гейт только debounce-пути
+    // (onTextChanged/onCursorPositionChanged). Ручной requestSuggestion/
+    // requestAlternative и АКТИВНАЯ генерация не затрагиваются:
+    // выключение авто не отменяет запрос «в полёте».
+    void setAutoSuggestions(bool enabled);
+    bool autoSuggestions() const { return m_autoSuggestions; }
+
     void setEnabled(bool enabled);
     bool isEnabled() const { return m_enabled; }
 
@@ -167,6 +181,9 @@ private:
     int m_maxTokens = 64;
     double m_temperature = 0.7;
     double m_topP = 0.9;
+
+    int m_debounceIntervalMs = 500;
+    bool m_autoSuggestions = true;
 
     State m_state = State::Idle;
     bool m_enabled = true;
