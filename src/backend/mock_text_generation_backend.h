@@ -1,0 +1,49 @@
+// mock_text_generation_backend.h
+#pragma once
+
+#include "text_generation_backend.h"
+
+#include <QSet>
+
+// Mock AI-backend'а: тестовая подсказка через небольшую задержку,
+// без модели. НЕ живёт в UI-потоке: создатель обязан сделать
+// moveToThread() в рабочий QThread (так и используется в MainWindow
+// и в тестах).
+//
+// generate()/cancel() безопасны из любого потока: вызов лишь
+// ставит работу в очередь события потока объекта.
+//
+// Режимы для тестов:
+//  - setSimulateError()  — имитация ошибки генерации;
+//  - setIgnoreCancel()   — «плохой» backend: игнорирует cancel()
+//                          и отвечает на отменённый запрос (проверка,
+//                          что потребитель отбрасывает по requestId).
+class MockTextGenerationBackend final : public ITextGenerationBackend
+{
+    Q_OBJECT
+
+public:
+    explicit MockTextGenerationBackend(QObject* parent = nullptr);
+
+    // Настройки вызываются ДО запуска потока (не потокобезопасны).
+    void setDelayMs(int delayMs);
+    void setSimulateError(bool enabled);
+    void setIgnoreCancel(bool enabled);
+
+    // ITextGenerationBackend
+    void generate(const GenerationRequest& request) override;
+    void cancel(quint64 requestId) override;
+
+private:
+    // Ниже — только в потоке объекта.
+    void scheduleFinish(GenerationRequest request);
+    void finish(GenerationRequest request,
+                bool cancelled,
+                qint64 elapsedMs);
+
+    int m_delayMs = 300;
+    bool m_simulateError = false;
+    bool m_ignoreCancel = false;
+
+    QSet<quint64> m_cancelledRequests;
+};

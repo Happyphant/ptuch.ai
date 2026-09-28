@@ -1,42 +1,239 @@
 # Ptuch Editor
 
-Простой текстовый редактор на Qt 6 Widgets.
+Qt 6 desktop-текстовый редактор с AI-подсказками (MVP).
 
-## Разметка окна
+## Требования
 
-- Окно разделено вертикально (сверху/снизу) через `QSplitter`.
-- **Верхняя часть**: слева — однострочное текстовое поле (`QLineEdit`),
-  справа — панель шириной 260px с `QComboBox` и рядом из пяти вертикальных
-  `QSlider`.
-- **Нижняя часть**: многострочный текстовый редактор (`QPlainTextEdit`),
-  занимающий всё доступное пространство.
-- Цветовая гамма: тёмно-серый фон (`#333`-`#454545`) и белый/светло-серый
-  текст, задаётся через `setStyleSheet` в `MainWindow::applyStyle()`.
+- **C++20**
+- **Qt 6** (Widgets), собран в `/Users/alexanderrabinov/Workspace/Qt/6.11.2-arm64`
+- **CMake ≥ 3.16** (рекомендуется Ninja)
+- **llama.cpp** — лежит в `third_party/llama.cpp` и подключается через `add_subdirectory`
+
+## Возможности (текущее состояние)
+
+- **Центральный виджет** — `QPlainTextEdit` (`setCentralWidget`).
+- **Верхняя панель состояния** — `QToolBar`: индикатор состояния
+  (Ready / Waiting / Generating / Error), кнопки **Generate** и
+  **Clear Suggestion**, `QLineEdit` и `QComboBox`; компоновка через
+  layouts (без абсолютного позиционирования).
+- **Статусная строка** (`QStatusBar`) с описанием текущего события.
+- Тёмная тема через `setStyleSheet` в `MainWindow::applyStyle()`.
+- Слой подсказок MVP: `SuggestionController` + `PlainTextEditorAdapter`
+  (доступ к тексту/курсору редактора) + абстракция `ITextGenerationBackend`
+  с mock-реализацией `MockTextGenerationBackend` (асинхронная «генерация»
+  на `QTimer` **в отдельном потоке**, без модели и без блокировки UI).
+  - debounce 500 мс после паузы в наборе;
+  - **ghost-подсказка** рисуется `SuggestionOverlay` поверх viewport'а
+    редактора: полупрозрачный текст у курсора (первая строка — сразу за
+    курсором, последующие — по левому краю), документ при этом не
+    меняется до принятия;
+  - **Tab** — принять подсказку (`acceptSuggestion`), **Shift+Tab** —
+    альтернатива, **Escape** — отклонить и отменить запрос
+    (`rejectSuggestion`); перевод клавиш — в `MainWindow::eventFilter`,
+    контроллер виджетов не видит; Tab без показанной подсказки
+    не перехватывается (вставляется табуляция); ввод символа и движение
+    курсора очищают подсказку;
+  - сигналы `suggestionStarted/Ready/Failed/Cleared` и `stateChanged`;
+  - явный `requestId` в каждом запросе: устаревшие ответы backend'а
+    отбрасываются, даже если тот игнорирует `cancel()`;
+  - DI: mock меняется на реальный backend через
+    `SuggestionController::setBackend()` без изменения потребителя;
+  - `MainWindow` не содержит логики inference — только wiring сигналов.
+- **Реальный backend llama.cpp** — `LlamaBackend` реализует
+  `ITextGenerationBackend` и подставляется через тот же `setBackend()`
+  (DI-точка), как только модель загружена:
+  - путь к GGUF: `PTUCH_MODEL_PATH` (файл) / `PTUCH_MODEL_DIR` (папка)
+    → настройки `QSettings` (орг. `PtuchAI`, ключ `llama/modelPath`) →
+    сканирование папки `models/` проекта;
+  - модель загружается **один раз** queued-вызовом в отдельном потоке
+    `llamaWorker` (UI не блокируется, sleep в UI нет); при
+    отсутствии/ошибке загрузки остаётся mock-бэкенд (fallback +
+    сообщение в статусной строке);
+  - inference (`llama_decode`, sampling) — **только** в worker-потоке:
+    `generate()` из UI переносится queued-событием, `cancel()` —
+    атомарный флаг, который читает цикл генерации между чанками
+    prompt processing и токенами;
+  - `requestId` + отмена: устаревший запрос не стартует, отменённый
+    возвращает `stopReason="cancelled"`; потребитель сверяет
+    `requestId` независимо;
+  - `llama_model`/`llama_context` — RAII (освобождение в потоке
+    объекта при закрытии: `closeEvent → stopLlamaWorker`), один
+    контекст на объект и строго последовательная обработка запросов —
+    параллельного доступа к контексту нет;
+  - лимиты: `n_ctx` зажат (256..8192 и не больше контекста обучения),
+    промпт обрезается под `n_ctx` (сверху, ближе к курсору), генерация
+    ≤ 512 токенов; в UI — только `ITextGenerationBackend`;
+  - логирование категорией `ptuch.llama`: путь и время загрузки,
+    `n_ctx`/потоки, число токенов промпта, время prompt processing,
+    время генерации, причина остановки, поток выполнения.
 
 ## Структура
 
 ```
 CMakeLists.txt
 src/
-  main.cpp
-  MainWindow.h
-  MainWindow.cpp
+  main.cpp                      # composition root: QApplication, имена для QSettings;
+                                # потоки backend'ов заводит MainWindow
+  UI/
+    MainWindow.h / .cpp         # central QPlainTextEdit, toolbar, статусная строка, wiring
+                                # (mock + llama: setupLlamaBackend/stopLlamaWorker)
+    suggestion_overlay.h / .cpp # ghost-подсказка поверх viewport'а (документ не трогает)
+  llama/
+    llama_backend.h / .cpp      # LlamaBackend: ITextGenerationBackend поверх llama.cpp
+                                # (pimpl, worker-поток, RAII, отмена, логи ptuch.llama)
+  backend/
+    text_generation_backend.h   # ITextGenerationBackend + GenerationRequest/Result
+    mock_text_generation_backend.h/.cpp # mock: задержка, ошибка, отмена,
+                                 # живёт в отдельном (не UI) потоке
+  suggestion/
+    suggestion_controller.h/.cpp # debounce, generation id, сигналы
+                                 # suggestion*/stateChanged (без виджетов)
+    document_state.h/.cpp       # снимок документа + безопасный контекст (обрезка)
+    editor_adapter.h/.cpp       # QPlainTextEdit -> ISuggestionEditor
+tests/
+  document_state_test.cpp       # Qt Test: DocumentState
+  suggestion_controller_test.cpp # Qt Test: debounce, устаревшие ответы
+  mock_text_generation_backend_test.cpp # Qt Test: поток, ошибка, отмена
+  ghost_suggestion_test.cpp    # Qt Test: overlay (пиксели) + клавиши Tab/Escape
+                               # + жизненный цикл MainWindow с реальной моделью
+  llama_backend_test.cpp       # Qt Test: контракт LlamaBackend + smoke с GGUF
+models/                         # *.gguf (в .gitignore)
+third_party/
+  llama.cpp/                    # вендор (не редактируется)
 ```
 
 ## Сборка
-
-Используется Qt 6.11.2 (arm64), собранный в
-`/Users/alexanderrabinov/Workspace/Qt/6.11.2-arm64`.
 
 ```bash
 cmake -S . -B build -G Ninja \
   -DCMAKE_PREFIX_PATH=/Users/alexanderrabinov/Workspace/Qt/6.11.2-arm64 \
   -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+
+cmake --build build -j
 ```
+
+При желании Ninja можно заменить на Makefiles — флаг `-G Ninja` просто убирается.
+
+### Предупреждения
+
+Для кода проекта включены `-Wall -Wextra` (MSVC: `/W4`).
+На third_party (`llama.cpp`, `ggml`) предупреждения **не** распространяются.
+
+## Тесты
+
+Unit-тесты на **Qt Test** (входит в Qt 6, внешних зависимостей нет):
+
+```bash
+ctest --test-dir build --output-on-failure
+# или напрямую
+./build/DocumentStateTests
+./build/SuggestionControllerTests
+./build/MockTextGenerationBackendTests
+./build/GhostSuggestionTests
+./build/LlamaBackendTests
+```
+
+Медленные проверки с реальной моделью (2 ГБ GGUF в `models/`) в `ctest`
+по умолчанию **не** входят — включаются переменной окружения:
+
+```bash
+PTUCH_MODEL_TESTS=1 ./build/LlamaBackendTests          # smoke: загрузка, генерация, отмена
+PTUCH_MODEL_TESTS=1 ./build/GhostSuggestionTests        # + жизненный цикл MainWindow с моделью
+```
+
+Покрытие:
+
+- `DocumentState` — пустой документ, курсор в начале/середине,
+  большой текст (обрезка префикса/суффикса, жёсткий потолок размера),
+  зажим курсора в границах, смена generation id, исключение ghost-подсказки
+  из контекста.
+- `SuggestionController` — debounce (непрерывная печать не порождает
+  запросов, после паузы ровно один), пустой контекст без генерации,
+  мгновенный ручной `requestSuggestion` (и параметры запроса), рост
+  generation id, игнорирование устаревшего ответа, отмена по
+  `rejectSuggestion`, ошибки backend'а, `acceptSuggestion`, `setStyleMix`.
+  Тесты идут без виджетов — только через интерфейсы.
+- `MockTextGenerationBackend` — работа в отдельном потоке (не в
+  UI-потоке), задержка и `elapsedMs`, явный `requestId` у конкурентных
+  запросов, имитация ошибки, отмена запроса (честный режим и режим
+  `ignoreCancel` — «плохой» backend отвечает на отменённый запрос).
+- `GhostSuggestion` — overlay рисует ghost у курсора (пиксельная проверка
+  рендера: положение рядом с курсором, полупрозрачность alpha ≤ 130,
+  документ не изменён), многострочные подсказки (вторая строка по левому
+  краю, лишних строк нет), мышь/фокус overlay прозрачны, а также полный
+  сценарий клавиш в `MainWindow`: печать → подсказка, **Tab** принимает
+  (текст в документе), Tab без подсказки проходит в редактор (вставляется
+  `\t`), ввод символа и движение курсора чистят подсказку, **Escape**
+  отклоняет без изменения документа. Отдельный слот
+  `mainWindowLoadsRealModelAndClosesCleanly` (под `PTUCH_MODEL_TESTS=1`)
+  грузит реальную GGUF через `MainWindow` и закрывает окно — проверка
+  `closeEvent → stopLlamaWorker → RAII`-освобождения.
+- `LlamaBackend` — поиск модели (env override, несуществующий путь не
+  возвращается), ошибка «модель не загружена» с эхо `requestId`,
+  асинхронность `generate()` из чужого потока (queued-диспетчеризация:
+  сразу после вызова ответа нет), безопасная отмена неизвестного id.
+  Smoke под `PTUCH_MODEL_TESTS=1`: загрузка GGUF в worker-потоке
+  (проверка потока исполнения сигналом), генерация (непустой текст,
+  `elapsedMs`, допустимые `stopReason`), идемпотентный повтор
+  `loadModel()`, отмена → `stopReason="cancelled"`.
+
+Снимок ghost-подсказки для ручного просмотра (по желанию):
+
+```bash
+PTUCH_GHOST_SCREENSHOT=/tmp/ptuch_ghost.png ./build/GhostSuggestionTests
+open /tmp/ptuch_ghost.png
+```
+
+Ручной сценарий проверки клавиш (в запущенном редакторе):
+
+1. Печатаем слово и ждём ~1 сек — после курсора появляется
+   полупрозрачная подсказка; документ при этом не изменился.
+2. **Tab** — подсказка вставляется в документ, призрак исчезает.
+3. Печатаем ещё слово, ждём подсказку, нажимаем **Escape** — подсказка
+   исчезает, документ не изменился.
+4. Снова ждём подсказку и вводим обычный символ — подсказка гаснет,
+   символ попадает в документ.
+5. Ждём подсказку и нажимаем стрелку — подсказка гаснет.
+6. Без показанной подсказки нажимаем **Tab** — вставляется табуляция
+   (клавиша не перехватывается).
+
+Отключается опцией `-DPTUCH_BUILD_TESTS=OFF`.
 
 ## Запуск
 
 ```bash
 ./build/PtuchEditor.app/Contents/MacOS/PtuchEditor
+# или
+open build/PtuchEditor.app
 ```
+
+### Модель (llama.cpp)
+
+При старте `MainWindow` ищет GGUF и грузит её в фоне (первым
+приоритетом — переменная окружения, затем настройки, затем `models/`):
+
+| Источник | Ключ / правило |
+| --- | --- |
+| Окружение | `PTUCH_MODEL_PATH` (файл) или `PTUCH_MODEL_DIR` (папка с `*.gguf`) |
+| Настройки | `QSettings` org `PtuchAI`, app `PtuchEditor`, ключ `llama/modelPath` |
+| Папка проекта | первый `*.gguf` в `models/` (cwd, каталог бинаря или бандла) |
+
+- Модель не найдена / не загрузилась — подсказки остаются на mock,
+  причина пишется в статусную строку.
+- `PTUCH_DISABLE_LLAMA=1` — не искать и не грузить модель (используется
+  UI-тестами).
+- Логи llama-части (загрузка, токены, тайминги, причины остановки):
+
+```bash
+./build/PtuchEditor.app/Contents/MacOS/PtuchEditor 2>&1 | grep ptuch.llama
+```
+
+## Стандарт и автогенерация Qt
+
+- `CMAKE_CXX_STANDARD 20` и `target_compile_features(... cxx_std_20)` —
+  применяются только к таргету `PtuchEditor` (llama.cpp остаётся на C++17,
+  чтобы не пересобирать third_party).
+- `CMAKE_AUTOMOC` / `CMAKE_AUTOUIC` / `CMAKE_AUTORCC` включены явно и
+  продублированы свойствами таргета.
+- Глобальных mutable-объектов в коде нет: состояние backend'а инкапсулировано
+  в pimpl, живущем в своём потоке; метатипы регистрируются в конструкторе.

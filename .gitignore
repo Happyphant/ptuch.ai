@@ -1,5 +1,17 @@
+# Сборка
 build/
 build-*/
-*.user
-.DS_Store
+cmake-build-*/
+CMakeUserPresets.json
+
+# Редакторы / IDE
 .vscode/
+.idea/
+*.user
+*.user.*
+
+# macOS
+.DS_Store
+
+# Модели (не хранятся в репозитории)
+models/*
