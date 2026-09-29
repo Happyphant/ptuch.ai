@@ -3,18 +3,21 @@
 
 #include "UI/MainWindow.h"
 #include "UI/settings_dialog.h"
+#include "UI/style_panel.h"
 #include "UI/suggestion_overlay.h"
 #include "llama/llama_backend.h"
 #include "settings/app_settings.h"
 #include "suggestion/suggestion_controller.h"
 
 #include <QCheckBox>
+#include <QDockWidget>
 #include <QFontMetrics>
 #include <QImage>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QPixmap>
 #include <QSettings>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QTextCursor>
@@ -124,6 +127,7 @@ private slots:
     void overlayWrapsLongSuggestionToViewport();
     void keysScenario();
     void settingsDialogAppliesAndPersists();
+    void styleMixChangeClearsGhostSuggestion();
     void diagnosticsButtonOpensDialog(); // gated: PTUCH_DIAGNOSTICS
     void mainWindowLoadsRealModelAndClosesCleanly();
 
@@ -458,6 +462,69 @@ void GhostSuggestionTest::settingsDialogAppliesAndPersists()
     settings.setValue(AppSettings::keyDebounceMs, 500);
     settings.setValue(AppSettings::keyAutoSuggestions, true);
     settings.sync();
+}
+
+// StylePanel в MainWindow подключён к контроллеру: изменение микса
+// чистит показанную ghost-подсказку (setStyleMix -> clearSuggestion),
+// нормализованные веса доходят до контроллера, и контроллер
+// продолжает работать — перепланированный запрос приносит новую
+// подсказку уже с новым миксом.
+void GhostSuggestionTest::styleMixChangeClearsGhostSuggestion()
+{
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    auto* controller = window.findChild<SuggestionController*>();
+    auto* overlay = window.findChild<SuggestionOverlay*>();
+    QVERIFY(editor && controller && overlay);
+
+    // Панель стилей — в отдельном dock (модель — внутри панели).
+    auto* panel =
+        window.findChild<StylePanel*>(QStringLiteral("stylePanel"));
+    QVERIFY2(panel, "StylePanel не создан в MainWindow");
+    auto* dock = window.findChild<QDockWidget*>(
+        QStringLiteral("styleDock"));
+    QVERIFY2(dock, "QDockWidget стилей не создан");
+
+    // Фокус обязателен: без него контроллер не стартует debounce.
+    window.activateWindow();
+    editor->setFocus();
+    QVERIFY(QTest::qWaitFor([&]() { return editor->hasFocus(); }, 3000));
+
+    // Печать -> debounce (500 мс) -> mock (~300 мс) -> ghost показан.
+    QTest::keyClicks(editor, QStringLiteral("hello"));
+    QVERIFY(QTest::qWaitFor([&]() { return controller->hasSuggestion(); },
+                            5000));
+    QVERIFY(overlay->isVisible());
+
+    // Меняем микс: слайдер первого профиля.
+    auto* slider =
+        panel->findChild<QSlider*>(QStringLiteral("slider_pushkin"));
+    QVERIFY(slider);
+    slider->setValue(60);
+
+    // Требование: текущая ghost очищена немедленно, документ цел.
+    QVERIFY2(!controller->hasSuggestion(),
+             "Смена микса должна очистить ghost-подсказку");
+    QVERIFY(!overlay->isVisible());
+    QCOMPARE(editor->toPlainText(), QStringLiteral("hello"));
+
+    // Нормализованные веса дошли до контроллера (считает модель панели).
+    const QVector<StyleWeight>& mix = controller->styles();
+    QCOMPARE(mix.size(), 1);
+    QCOMPARE(mix.first().styleId, QStringLiteral("pushkin"));
+    QVERIFY(qFuzzyCompare(double(mix.first().weight), 1.0));
+
+    // Контроллер жив: перепланированный setStyleMix-ом запрос приносит
+    // свежую подсказку (микс применён, дебаунс перезапущен).
+    QVERIFY(QTest::qWaitFor([&]() { return controller->hasSuggestion(); },
+                            5000));
+    QVERIFY(overlay->isVisible());
+    QCOMPARE(editor->toPlainText(), QStringLiteral("hello"));
 }
 
 void GhostSuggestionTest::diagnosticsButtonOpensDialog()

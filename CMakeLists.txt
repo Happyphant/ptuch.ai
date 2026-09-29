@@ -93,6 +93,8 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
     ${PTUCH_DIAGNOSTIC_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
@@ -107,6 +109,10 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
 )
 
 set_target_properties(PtuchEditor PROPERTIES
@@ -233,6 +239,14 @@ if(PTUCH_BUILD_TESTS)
         # при включённом PTUCH_DIAGNOSTICS (кнопка Diagnostics).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        # MainWindow создаёт StylePanel (правый dock со стилями).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        # Модель StylePanel — доменный микшер без виджетов.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
         ${PTUCH_DIAGNOSTIC_SOURCES}
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
@@ -328,4 +342,69 @@ if(PTUCH_BUILD_TESTS)
     )
 
     add_test(NAME Settings COMMAND SettingsTests)
+
+    # Тесты стилевых профилей: StyleProfile (встроенные профили —
+    # обязательные поля, уникальные id, юридически нейтральные имена,
+    # стартовый вес 0) и StyleMixer (санитизация весов, кламп,
+    # предсказуемая сумма активных весов — normalize() и нормализация
+    # на лету дают 1.0, нулевые/выключенные не попадают в prompt,
+    # компактная инструкция не разрастается от числа вызовов).
+    # Без Qt6::Widgets: QTEST_GUILESS_MAIN в тесте фиксирует, что
+    # StyleMixer не зависит от виджетов (нужен только Qt6::Gui под
+    # QColor цвета профиля).
+    add_executable(StyleMixerTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/style_mixer_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+        # StyleWeight — мост к GenerationRequest::styleWeights.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+    )
+
+    target_include_directories(StyleMixerTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(StyleMixerTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(StyleMixerTests)
+
+    target_link_libraries(StyleMixerTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+    )
+
+    add_test(NAME StyleMixer COMMAND StyleMixerTests)
+
+    # Тесты StylePanel: строки каждого профиля (маркер, слайдер 0..100,
+    # число, нормализованная доля, чекбокс, сброс), единый сигнал
+    # styleMixChanged (ровно один на действие, без циклических
+    # обновлений), сумма и нормализация из модели (StyleMixer), Reset
+    # Mix одним сигналом, тёмный stylesheet панели.
+    add_executable(StylePanelTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/style_panel_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+        # StyleWeight — payload сигнала styleMixChanged.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+    )
+
+    target_include_directories(StylePanelTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(StylePanelTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(StylePanelTests)
+
+    target_link_libraries(StylePanelTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+    )
+
+    add_test(NAME StylePanel COMMAND StylePanelTests)
 endif()

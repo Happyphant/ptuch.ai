@@ -14,6 +14,7 @@ class QThread;
 class MockTextGenerationBackend;
 class LlamaBackend;
 class PlainTextEditorAdapter;
+class StylePanel;
 class SuggestionOverlay;
 struct AppSettings;
 
@@ -35,6 +36,9 @@ protected:
 private:
     void createEditor();
     void createStatusPanel();
+    // Панель стилей (StylePanel) в правом dock: модель StyleMixer живёт
+    // внутри панели, MainWindow только подключает сигнал к контроллеру.
+    void createStylePanel();
     void setupController();
     // GGUF: llama-бэкенд в отдельном worker-потоке; при отсутствии
     // модели остаётся mock (fallback через setBackend).
@@ -66,6 +70,8 @@ private:
     QPushButton *m_generateButton = nullptr;
     QPushButton *m_clearButton = nullptr;
     QPushButton *m_settingsButton = nullptr;
+    // Стилевой микшер: отдельный dock справа (создаётся всегда).
+    StylePanel *m_stylePanel = nullptr;
     // Режим диагностики: создаётся только при PTUCH_DIAGNOSTICS=1.
     QPushButton *m_diagnosticsButton = nullptr;
     QLineEdit *m_textInput = nullptr;

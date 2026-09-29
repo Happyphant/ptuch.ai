@@ -110,6 +110,29 @@ Qt 6 desktop-текстовый редактор с AI-подсказками (M
   - **режим отключаем**: опция `PTUCH_DIAGNOSTICS` (по умолчанию ON
     в Debug, OFF в Release) вырезает кнопку, диалог и их тесты —
     см. «Сборка»; API `diagnostics()` и метрики остаются.
+- **Стилевые профили** — `StyleProfile` (id, имя, описание, цвет,
+  prompt-инструкция, вес, enabled) и `StyleMixer` (домен без
+  Qt-виджетов): встроенные «Пушкин», «Тютчев», «Киберпанк 80-х»,
+  «Официальный стиль» — имена исторических авторов описательные, для
+  живых авторов и публичных персон используются только нейтральные
+  названия (юридические оговорки ТЗ); вес в `[0..1]`, сумма активных
+  весов **предсказуема** (нормализация до 1.0 — в `normalize()` и на
+  лету в `styleWeights()` → `SuggestionController::setStyleMix`),
+  нулевые/выключенные в prompt не попадают; `buildInstruction()`
+  собирает компактную инструкцию по одной строке на активный профиль
+  и **не разрастается** от числа событий UI.
+- **Панель стилей** — `StylePanel` (QWidget) в правом dock: строка на
+  профиль (цветовой маркер, название, слайдер 0..100, числовое
+  значение, нормализованная доля, чекбокс включения, кнопка сброса),
+  внизу — сумма активных весов и кнопка **Reset Mix**; единый сигнал
+  `styleMixChanged` (нормализованные веса) подключается в `MainWindow`
+  к `SuggestionController::setStyleMix` — **смена микса очищает
+  текущую ghost-подсказку** (контроллер убирает устаревшую и
+  перепланирует запрос). Модель (`StyleMixer`) отделена от виджетов;
+  циклических обновлений нет: обработчики меняют только подписи, один
+  жест = ровно один сигнал (программные `setValue` — под
+  `QSignalBlocker`), при отсутствии изменений сигнала нет. Панель
+  приносит собственный тёмный stylesheet.
 
 ## Структура
 
@@ -122,12 +145,18 @@ src/
     MainWindow.h / .cpp         # central QPlainTextEdit, toolbar, статусная строка, wiring
                                 # (mock + llama: setupLlamaBackend/stopLlamaWorker;
                                 #  настройки: openSettings/applySettings/reloadLlamaBackend;
-                                #  диагностика: openDiagnostics — под PTUCH_DIAGNOSTICS)
+                                #  диагностика: openDiagnostics — под PTUCH_DIAGNOSTICS;
+                                #  стили: createStylePanel + styleMixChanged -> setStyleMix)
     suggestion_overlay.h / .cpp # ghost-подсказка поверх viewport'а (документ не трогает)
     settings_dialog.h / .cpp    # SettingsDialog: поля с диапазонами, выбор файла,
                                 # Test Model на временном LlamaBackend (свой поток)
     diagnostics_dialog.h / .cpp # DiagnosticsDialog: снимок BackendDiagnostics + копирование
                                 # отчёта в буфер (сборка только при PTUCH_DIAGNOSTICS=ON)
+    style_panel.h / .cpp        # StylePanel (QWidget): строки профилей — маркер,
+                                # слайдер 0..100, значение, нормализованная доля,
+                                # чекбокс, сброс; сумма + Reset Mix; единый сигнал
+                                # styleMixChanged; модель (StyleMixer) отделена от UI;
+                                # собственный тёмный stylesheet
   settings/
     app_settings.h / .cpp       # AppSettings: единый источник ключей/дефолтов/диапазонов
                                 # QSettings + sanitize() (защита от мусора)
@@ -144,6 +173,12 @@ src/
                                  # suggestion*/stateChanged (без виджетов)
     document_state.h/.cpp       # снимок документа + безопасный контекст (обрезка)
     editor_adapter.h/.cpp       # QPlainTextEdit -> ISuggestionEditor
+    style_profile.h/.cpp        # StyleProfile + встроенные профили
+                                # (Пушкин, Тютчев, «Киберпанк 80-х»,
+                                #  «Официальный стиль» — юр. оговорки ТЗ)
+    style_mixer.h/.cpp          # StyleMixer: веса [0..1], нормализация
+                                # до суммы 1.0, компактная prompt-
+                                # инструкция (без Qt-виджетов)
 tests/
   document_state_test.cpp       # Qt Test: DocumentState
   suggestion_controller_test.cpp # Qt Test: debounce, устаревшие ответы
@@ -154,6 +189,10 @@ tests/
   settings_test.cpp            # Qt Test: AppSettings (дефолты/roundtrip/санитизация)
                                # + SettingsDialog (диапазоны, ошибка Test Model)
                                # + диагностика (отчёт, диалог, буфер обмена)
+  style_mixer_test.cpp         # Qt Test: профили, веса/нормализация, prompt
+                               # без нулевых, компактность инструкции
+  style_panel_test.cpp         # Qt Test: строки панели, единый сигнал
+                               # styleMixChanged, сумма/доли, Reset Mix
 models/                         # *.gguf (в .gitignore)
 third_party/
   llama.cpp/                    # вендор (не редактируется)
@@ -205,6 +244,8 @@ ctest --test-dir build --output-on-failure
 ./build/GhostSuggestionTests
 ./build/LlamaBackendTests
 ./build/SettingsTests
+./build/StyleMixerTests
+./build/StylePanelTests
 ```
 
 Медленные проверки с реальной моделью (2 ГБ GGUF в `models/`) в `ctest`
@@ -252,7 +293,12 @@ PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диа
   `diagnosticsButtonOpensDialog` (при `PTUCH_DIAGNOSTICS=ON`, иначе
   `QSKIP`) открывает диалог кнопкой **Diagnostics**, проверяет снимок
   mock-бэкенда («mock», у модели «—») и копирование отчёта в буфер
-  без адресов. Отдельный слот
+  без адресов. Слот
+  `styleMixChangeClearsGhostSuggestion` проверяет связку
+  `StylePanel` (правый dock) → `setStyleMix`: смена слайдера
+  немедленно чистит показанную ghost-подсказку (документ цел),
+  нормализованные веса доходят до контроллера (`styles()`), а
+  перепланированный запрос приносит свежую подсказку. Отдельный слот
   `mainWindowLoadsRealModelAndClosesCleanly` (под `PTUCH_MODEL_TESTS=1`)
   грузит реальную GGUF через `MainWindow` и закрывает окно — проверка
   `closeEvent → stopLlamaWorker → RAII`-освобождения.
@@ -285,6 +331,30 @@ PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диа
   секунду», «—» для пустых значений, отсутствие адресов `0x`; диалог:
   метки соответствуют полям снимка, кнопка **Копировать** кладёт отчёт
   в буфер обмена.
+- `StyleMixer` — встроенные профили (4 шт.: обязательные поля,
+  уникальные id, стартовый вес 0, нейтральные имена), санитизация
+  веса в конструкторе (NaN / >1 / отрицательный), кламп `setWeight`
+  в `[0; 1]` и `false` для неизвестного id; предсказуемая сумма
+  активных весов: `normalize()` доводит до ровно 1.0, сохраняя
+  пропорции (идемпотентно), `styleWeights()` нормализует на лету без
+  вызова `normalize()` (сумма 1.0, мост к `setStyleMix`); нулевые и
+  выключенные профили не попадают ни в веса, ни в prompt;
+  `buildInstruction()` — по строке на активный профиль с
+  нормализованным весом, профиль без текста инструкции не даёт пустых
+  строк, 100 повторных вызовов дают идентичный результат (prompt не
+  разрастается от событий UI). Тесты собираются без `Qt6::Widgets`
+  (`QTEST_GUILESS_MAIN`) — фиксация отсутствия зависимости от
+  виджетов.
+- `StylePanel` — строки всех встроенных профилей (маркер покрашен в
+  цвет профиля, слайдер строго 0..100, стартовые значения: 0, «—»,
+  чекбокс включён; построение панели без сигналов), единый сигнал
+  `styleMixChanged`: ровно один на действие (слайдер, тоггл чекбокса,
+  сброс профиля, одним сигналом и **Reset Mix** через
+  `QSignalBlocker`), при повторе значения и на пустом миксе — без
+  сигнала (нет петель); сумма и нормализованные доли считаются
+  моделью: `Сумма: 1.20` → доли `0.67`/`0.33`, неактивные — «—»;
+  выключение профиля гасит его слайдер и убирает из микса; тёмный
+  stylesheet панели (фон/текст/акцент).
 
 Снимок ghost-подсказки для ручного просмотра (по желанию):
 

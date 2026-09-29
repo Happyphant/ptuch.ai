@@ -9,10 +9,12 @@
 #include "settings_dialog.h"
 #include "suggestion/editor_adapter.h"
 #include "suggestion/suggestion_controller.h"
+#include "style_panel.h"
 #include "suggestion_overlay.h"
 
 #include <QComboBox>
 #include <QCloseEvent>
+#include <QDockWidget>
 #include <QFileInfo>
 #include <QKeyEvent>
 #include <QLabel>
@@ -32,6 +34,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     createEditor();
     createStatusPanel();
+    createStylePanel();
     setupController();
 
     applyStyle();
@@ -129,6 +132,21 @@ void MainWindow::createStatusPanel()
     bar->addWidget(m_comboBox);
 }
 
+void MainWindow::createStylePanel()
+{
+    // Правый dock: панель сама держит модель (StyleMixer) и приносит
+    // собственный тёмный stylesheet. MainWindow не считает микс —
+    // только связка сигнала с контроллером (см. setupController()).
+    auto *dock = new QDockWidget(tr("Стили"), this);
+    dock->setObjectName(QStringLiteral("styleDock"));
+    dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+
+    m_stylePanel = new StylePanel(dock); // objectName — из конструктора
+    dock->setWidget(m_stylePanel);
+
+    addDockWidget(Qt::RightDockWidgetArea, dock);
+}
+
 void MainWindow::setupController()
 {
     // Адаптер даёт контроллеру доступ к тексту и курсору редактора.
@@ -184,6 +202,13 @@ void MainWindow::setupController()
     connect(m_diagnosticsButton, &QPushButton::clicked,
             this, &MainWindow::openDiagnostics);
 #endif
+
+    // Стилевой микс -> контроллер: единый сигнал панели. Сам
+    // setStyleMix() убирает показанную ghost-подсказку (она сделана
+    // под прежний микс) и перепланирует запрос с новыми весами —
+    // MainWindow здесь ничего не считает, только соединяет.
+    connect(m_stylePanel, &StylePanel::styleMixChanged,
+            m_controller, &SuggestionController::setStyleMix);
 
     // Контроллер -> индикатор состояния (сам контроллер виджетов не знает)
     connect(m_controller, &SuggestionController::stateChanged,
@@ -559,6 +584,20 @@ void MainWindow::applyStyle()
             background-color: #2f2f2f;
             color: #cccccc;
             border-top: 1px solid #2a2a2a;
+        }
+
+        /* Хост для StylePanel (сама панель стилизует своё содержимое). */
+        QDockWidget#styleDock {
+            background-color: #333333;
+            color: #f0f0f0;
+        }
+
+        QDockWidget#styleDock::title {
+            background-color: #2f2f2f;
+            color: #cccccc;
+            text-align: left;
+            padding: 6px;
+            border-bottom: 1px solid #2a2a2a;
         }
 
         QPlainTextEdit#mainEditor {

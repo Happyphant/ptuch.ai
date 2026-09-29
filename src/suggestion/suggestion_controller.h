@@ -118,6 +118,10 @@ public:
     bool hasSuggestion() const;
     quint64 generationId() const { return m_generationId; }
     ITextGenerationBackend* backend() const { return m_backend; }
+    // Текущая смесь стилей — нормализованные веса, которые уходят в
+    // каждый следующий запрос (для UI/тестов; меняется только через
+    // setStyleMix — он же чистит показанную подсказку).
+    const QVector<StyleWeight>& styles() const { return m_styles; }
     // Снимок документа последнего запроса (для отладки/тестов).
     const DocumentState& documentState() const { return m_documentState; }
 
