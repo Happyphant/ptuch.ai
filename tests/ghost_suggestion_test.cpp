@@ -21,6 +21,14 @@
 #include <QTextDocument>
 #include <QTimer>
 
+#if PTUCH_DIAGNOSTICS
+// Режим диагностики: диалог снимка (слот ниже QSKIP при опции OFF).
+#include "UI/diagnostics_dialog.h"
+#include <QClipboard>
+#include <QGuiApplication>
+#include <QLabel>
+#endif
+
 namespace {
 
 // Только ключи нашего приложения: QSettings::allKeys() включает и
@@ -116,6 +124,7 @@ private slots:
     void overlayWrapsLongSuggestionToViewport();
     void keysScenario();
     void settingsDialogAppliesAndPersists();
+    void diagnosticsButtonOpensDialog(); // gated: PTUCH_DIAGNOSTICS
     void mainWindowLoadsRealModelAndClosesCleanly();
 
 private:
@@ -449,6 +458,58 @@ void GhostSuggestionTest::settingsDialogAppliesAndPersists()
     settings.setValue(AppSettings::keyDebounceMs, 500);
     settings.setValue(AppSettings::keyAutoSuggestions, true);
     settings.sync();
+}
+
+void GhostSuggestionTest::diagnosticsButtonOpensDialog()
+{
+#if PTUCH_DIAGNOSTICS
+    MainWindow window;
+
+    auto* button = window.findChild<QPushButton*>(
+        QStringLiteral("diagnosticsButton"));
+    QVERIFY2(button, "Кнопка Diagnostics не создана");
+
+    QString backendText;
+    QString modelText;
+    QString copiedReport;
+    // click() -> openDiagnostics() -> dialog.exec() (вложенный event
+    // loop): таймер срабатывает внутри exec — читает метки, жмёт
+    // «Копировать» и закрывает диалог.
+    QTimer::singleShot(0, &window, [&]() {
+        auto* dialog = window.findChild<DiagnosticsDialog*>(
+            QStringLiteral("diagnosticsDialog"));
+        if (dialog == nullptr)
+            return;
+        auto* backendLabel = dialog->findChild<QLabel*>(
+            QStringLiteral("backendValue"));
+        auto* modelLabel = dialog->findChild<QLabel*>(
+            QStringLiteral("modelValue"));
+        auto* copy = dialog->findChild<QPushButton*>(
+            QStringLiteral("copyButton"));
+        if (backendLabel == nullptr || modelLabel == nullptr
+            || copy == nullptr)
+            return;
+        backendText = backendLabel->text();
+        modelText = modelLabel->text();
+        copy->click();
+        copiedReport = QGuiApplication::clipboard()->text();
+        dialog->accept();
+    });
+
+    button->click(); // модальный exec до accept()
+    QVERIFY2(!backendText.isEmpty(), "Диагностика не открылась");
+
+    // Активный backend в этих тестах — mock (llama отключён через
+    // PTUCH_DISABLE_LLAMA): имя модели отсутствует («—»).
+    QCOMPARE(backendText, QStringLiteral("mock"));
+    QCOMPARE(modelText, QStringLiteral("—"));
+    QVERIFY2(copiedReport.contains(QStringLiteral("mock")),
+             "Отчёт не скопирован в буфер обмена");
+    QVERIFY2(!copiedReport.contains(QStringLiteral("0x")),
+             "Отчёт не должен содержать адреса");
+#else
+    QSKIP("Режим диагностики выключен (PTUCH_DIAGNOSTICS=OFF)");
+#endif
 }
 
 void GhostSuggestionTest::mainWindowLoadsRealModelAndClosesCleanly()

@@ -15,6 +15,14 @@
 #include <QSpinBox>
 #include <QTemporaryDir>
 
+#if PTUCH_DIAGNOSTICS
+// Режим диагностики: диалог снимка и его тесты (слоты ниже при
+// выключенной опции QSKIP и не компилируются в этот файл).
+#include "UI/diagnostics_dialog.h"
+#include <QClipboard>
+#include <QGuiApplication>
+#endif
+
 namespace {
 
 // Только ключи нашего приложения: QSettings::allKeys() включает и
@@ -55,6 +63,10 @@ private slots:
     void testModelReportsMissingFileWithoutBlocking();
     void testModelReportsCorruptGguf();
     void testModelRealGgufLoads(); // gated: PTUCH_MODEL_TESTS=1
+
+    // Диагностика backend'а (слоты сами QSKIP при PTUCH_DIAGNOSTICS=0).
+    void diagnosticsReportFormatsSnapshot();
+    void diagnosticsDialogShowsAndCopiesReport();
 
 private:
     static QSettings makeSettings()
@@ -419,6 +431,102 @@ void SettingsTest::testModelRealGgufLoads()
 
     // Деструктор диалога останавливает тест-поток (RAII) — падение
     // здесь из-за зависшего потока завалит тест.
+}
+
+void SettingsTest::diagnosticsReportFormatsSnapshot()
+{
+#if PTUCH_DIAGNOSTICS
+    // Полный снимок: каждое поле попадает в отчёт (включая
+    // посчитанные «токенов в секунду»), плюс проверка, что отчёт
+    // строится только из полей снимка — без указателей и адресов.
+    BackendDiagnostics data;
+    data.backendName = QStringLiteral("llama.cpp");
+    data.modelName = QStringLiteral("test-model.gguf");
+    data.contextSize = 4096;
+    data.gpuLayers = -1;
+    data.promptTokens = 128;
+    data.generatedTokens = 64;
+    data.promptProcessingMs = 250;
+    data.generationMs = 3000;
+    data.lastError = QStringLiteral("последняя ошибка");
+
+    const QString report = DiagnosticsDialog::formatReport(data);
+    QVERIFY(report.contains(QStringLiteral("llama.cpp")));
+    QVERIFY(report.contains(QStringLiteral("test-model.gguf")));
+    QVERIFY(report.contains(QStringLiteral("4096")));
+    QVERIFY(report.contains(QStringLiteral("-1"))); // все слои
+    QVERIFY(report.contains(QStringLiteral("128")));
+    QVERIFY(report.contains(QStringLiteral("64")));
+    QVERIFY(report.contains(QStringLiteral("250")));
+    QVERIFY(report.contains(QStringLiteral("3000")));
+    // 64 токена за 3000 мс = 21.3 т/с.
+    QVERIFY(report.contains(QStringLiteral("21.3")));
+    QVERIFY(report.contains(QStringLiteral("последняя ошибка")));
+
+    // Необработанные указатели/внутренние адреса запрещены.
+    QVERIFY2(!report.contains(QStringLiteral("0x")),
+             "Отчёт диагностики не должен содержать адреса");
+
+    // Пустой снимок (mock / модель не загружена): поля «—», ошибок нет.
+    const QString empty = DiagnosticsDialog::formatReport(
+        BackendDiagnostics {});
+    QVERIFY(empty.contains(QStringLiteral("—")));
+    QVERIFY(empty.contains(QStringLiteral("нет ошибок")));
+#else
+    QSKIP("Режим диагностики выключен (PTUCH_DIAGNOSTICS=OFF)");
+#endif
+}
+
+void SettingsTest::diagnosticsDialogShowsAndCopiesReport()
+{
+#if PTUCH_DIAGNOSTICS
+    BackendDiagnostics data;
+    data.backendName = QStringLiteral("llama.cpp");
+    data.modelName = QStringLiteral("model.gguf");
+    data.contextSize = 2048;
+    data.gpuLayers = 20;
+    data.promptTokens = 10;
+    data.generatedTokens = 20;
+    data.promptProcessingMs = 50;
+    data.generationMs = 1000;
+    data.lastError = QStringLiteral("текст ошибки здесь");
+
+    DiagnosticsDialog dialog(data);
+    QCOMPARE(dialog.objectName(), QStringLiteral("diagnosticsDialog"));
+
+    // Каждое поле снимка — на своей метке (имена объектов стабильны).
+    const auto value = [&dialog](const char* name) {
+        auto* label =
+            dialog.findChild<QLabel*>(QString::fromLatin1(name));
+        return label != nullptr ? label->text() : QString();
+    };
+    QCOMPARE(value("backendValue"), QStringLiteral("llama.cpp"));
+    QCOMPARE(value("modelValue"), QStringLiteral("model.gguf"));
+    QCOMPARE(value("contextValue"), QStringLiteral("2048"));
+    QCOMPARE(value("gpuLayersValue"), QStringLiteral("20"));
+    QCOMPARE(value("promptTokensValue"), QStringLiteral("10"));
+    QCOMPARE(value("generatedTokensValue"), QStringLiteral("20"));
+    QCOMPARE(value("promptTimeValue"), QStringLiteral("50 мс"));
+    QCOMPARE(value("generationTimeValue"), QStringLiteral("1000 мс"));
+    // 20 токенов за 1000 мс = 20.0 т/с.
+    QCOMPARE(value("tpsValue"), QStringLiteral("20.0"));
+    QVERIFY(value("errorValue").contains(
+        QStringLiteral("текст ошибки здесь")));
+
+    // Кнопка копирования кладёт отчёт в буфер обмена — и только его
+    // поля (без адресов).
+    auto* copy = dialog.findChild<QPushButton*>(
+        QStringLiteral("copyButton"));
+    QVERIFY2(copy, "Кнопка Копировать не создана");
+    copy->click();
+    const QString clipboard = QGuiApplication::clipboard()->text();
+    QVERIFY2(clipboard.contains(QStringLiteral("model.gguf")),
+             "Отчёт не скопирован в буфер обмена");
+    QVERIFY(clipboard.contains(QStringLiteral("20.0")));
+    QVERIFY(!clipboard.contains(QStringLiteral("0x")));
+#else
+    QSKIP("Режим диагностики выключен (PTUCH_DIAGNOSTICS=OFF)");
+#endif
 }
 
 QTEST_MAIN(SettingsTest)

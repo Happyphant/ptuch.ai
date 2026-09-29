@@ -48,6 +48,10 @@ public:
     // ITextGenerationBackend: безопасны из любого потока.
     void generate(const GenerationRequest& request) override;
     void cancel(quint64 requestId) override;
+    // Снимок диагностики (потокобезопасная копия под мьютексом):
+    // имя модели, n_ctx, GPU-слои, метрики последнего успешного
+    // запроса и последняя ошибка.
+    BackendDiagnostics diagnostics() const override;
 
     // Прервать загрузку модели и текущую генерацию из любого потока
     // (атомарные флаги). Вызывается при закрытии приложения перед
@@ -74,6 +78,10 @@ private:
     // Вся llama-работа (загрузка/декод/sampling) — только здесь,
     // в потоке объекта.
     void generateInWorker(const GenerationRequest& request);
+    // Последняя ошибка диагностики (пустая строка = очистить — успех
+    // разрешает ошибку). Пишется из worker'а, читается из UI — под
+    // мьютексом снимка.
+    void setDiagnosticError(const QString& error);
 
     struct Private;
     std::unique_ptr<Private> d;

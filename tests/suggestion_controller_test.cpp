@@ -77,6 +77,12 @@ public:
         cancelled.push_back(requestId);
     }
 
+    BackendDiagnostics diagnostics() const override
+    {
+        // Тестовому backend'у диагностика не нужна — пустой снимок.
+        return {};
+    }
+
     int count() const { return int(requests.size()); }
 
     void respond(int index, const QString& text)

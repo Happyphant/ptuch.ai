@@ -44,6 +44,10 @@ private:
     void stopLlamaWorker();
     // Диалог настроек (SettingsDialog) -> применение результата.
     void openSettings();
+    // Режим диагностики backend'а: снимок BackendDiagnostics активного
+    // backend'а -> DiagnosticsDialog. Определяется только при сборке
+    // с PTUCH_DIAGNOSTICS=1 (см. CMake); кнопка в панели — тоже.
+    void openDiagnostics();
     // Применение настроек: параметры генерации — сразу без отмен
     // (активная генерация продолжается); модельные (путь/n_ctx/GPU) —
     // только при реальном изменении, безопасным свапом.
@@ -62,6 +66,8 @@ private:
     QPushButton *m_generateButton = nullptr;
     QPushButton *m_clearButton = nullptr;
     QPushButton *m_settingsButton = nullptr;
+    // Режим диагностики: создаётся только при PTUCH_DIAGNOSTICS=1.
+    QPushButton *m_diagnosticsButton = nullptr;
     QLineEdit *m_textInput = nullptr;
     QComboBox *m_comboBox = nullptr;
 

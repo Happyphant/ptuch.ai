@@ -51,6 +51,38 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup()
 
 # ---------------------------------------------------------------------------
+# Режим диагностики backend'а: кнопка Diagnostics, диалог снимка и отчёт
+# для копирования. По умолчанию — включён в Debug и отключён в Release
+# (переключается явно: cmake -DPTUCH_DIAGNOSTICS=ON|OFF). При выключении
+# UI-часть вырезается макросом PTUCH_DIAGNOSTICS и исключается из сборки;
+# API diagnostics() и метрики остаются (дешёвая инструментация, полезна
+# и в журналах Release).
+# ---------------------------------------------------------------------------
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(PTUCH_DIAGNOSTICS_DEFAULT OFF)
+else()
+    set(PTUCH_DIAGNOSTICS_DEFAULT ON)
+endif()
+option(PTUCH_DIAGNOSTICS
+       "Backend diagnostics mode (кнопка Diagnostics, диалог, отчёт)"
+       ${PTUCH_DIAGNOSTICS_DEFAULT})
+if(PTUCH_DIAGNOSTICS)
+    add_compile_definitions(PTUCH_DIAGNOSTICS=1)
+else()
+    add_compile_definitions(PTUCH_DIAGNOSTICS=0)
+endif()
+
+# Диалог диагностики собирается только при включённом режиме
+# (src/UI/diagnostics_dialog.* — иначе Release без этой UI-части).
+set(PTUCH_DIAGNOSTIC_SOURCES)
+if(PTUCH_DIAGNOSTICS)
+    list(APPEND PTUCH_DIAGNOSTIC_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/diagnostics_dialog.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/diagnostics_dialog.cpp"
+    )
+endif()
+
+# ---------------------------------------------------------------------------
 # Исполняемый таргет
 # ---------------------------------------------------------------------------
 qt_add_executable(PtuchEditor
@@ -61,6 +93,7 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+    ${PTUCH_DIAGNOSTIC_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
@@ -196,9 +229,11 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
         # MainWindow открывает SettingsDialog; тест проверяет применение
-        # настроек через кнопку Settings.
+        # настроек через кнопку Settings. Диалог диагностики — только
+        # при включённом PTUCH_DIAGNOSTICS (кнопка Diagnostics).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        ${PTUCH_DIAGNOSTIC_SOURCES}
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.cpp"
@@ -270,6 +305,9 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        # Тесты снимка диагностики — только при включённом режиме
+        # PTUCH_DIAGNOSTICS (при выключенной опции слоты QSKIP).
+        ${PTUCH_DIAGNOSTIC_SOURCES}
         # Test Model работает с временным LlamaBackend (свой поток).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"

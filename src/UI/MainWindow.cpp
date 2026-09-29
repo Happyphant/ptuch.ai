@@ -1,6 +1,9 @@
 #include "MainWindow.h"
 
 #include "backend/mock_text_generation_backend.h"
+#if PTUCH_DIAGNOSTICS
+#include "diagnostics_dialog.h"
+#endif
 #include "llama/llama_backend.h"
 #include "settings/app_settings.h"
 #include "settings_dialog.h"
@@ -95,6 +98,15 @@ void MainWindow::createStatusPanel()
     m_settingsButton->setObjectName("settingsButton");
     bar->addWidget(m_settingsButton);
 
+#if PTUCH_DIAGNOSTICS
+    // Режим диагностики backend'а: снимок метрик последнего успешного
+    // запроса (см. DiagnosticsDialog). В Release вырезается опцией
+    // PTUCH_DIAGNOSTICS=OFF — кнопка, диалог и их тесты не компилируются.
+    m_diagnosticsButton = new QPushButton(tr("Diagnostics"), bar);
+    m_diagnosticsButton->setObjectName("diagnosticsButton");
+    bar->addWidget(m_diagnosticsButton);
+#endif
+
     bar->addSeparator();
 
     // Растягивающийся вставкой блок: line edit прижимается вправо.
@@ -166,6 +178,12 @@ void MainWindow::setupController()
     // Настройки -> диалог -> applySettings (см. openSettings).
     connect(m_settingsButton, &QPushButton::clicked,
             this, &MainWindow::openSettings);
+
+#if PTUCH_DIAGNOSTICS
+    // Диагностика -> диалог со снимком активного backend'а.
+    connect(m_diagnosticsButton, &QPushButton::clicked,
+            this, &MainWindow::openDiagnostics);
+#endif
 
     // Контроллер -> индикатор состояния (сам контроллер виджетов не знает)
     connect(m_controller, &SuggestionController::stateChanged,
@@ -298,6 +316,22 @@ void MainWindow::openSettings()
 
     applySettings(dialog.settings());
 }
+
+#if PTUCH_DIAGNOSTICS
+void MainWindow::openDiagnostics()
+{
+    // Только чтение готового снимка через интерфейс backend'а — логики
+    // inference здесь нет; текст диалога формируется из полей снимка
+    // (без указателей и внутренних адресов backend'а).
+    const ITextGenerationBackend* backend =
+        m_controller != nullptr ? m_controller->backend() : nullptr;
+    const BackendDiagnostics data =
+        backend != nullptr ? backend->diagnostics() : BackendDiagnostics();
+
+    DiagnosticsDialog dialog(data, this);
+    dialog.exec();
+}
+#endif
 
 void MainWindow::applySettings(const AppSettings& settings)
 {

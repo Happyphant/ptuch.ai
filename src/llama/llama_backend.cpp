@@ -10,6 +10,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLoggingCategory>
+#include <QMutex>
 #include <QSettings>
 #include <QThread>
 
@@ -180,6 +181,12 @@ struct LlamaBackend::Private {
     int lastProgressPercent = -1;
     // Фактический n_ctx после успешной загрузки (для повторного modelLoaded).
     int lastContextSize = 0;
+
+    // Диагностика: пишется в configure/loadModel/generate (worker и
+    // UI-поток до старта потока), читается из UI — только под мьютексом
+    // коротким снимком-копией (см. LlamaBackend::diagnostics).
+    mutable QMutex diagnosticsMutex;
+    BackendDiagnostics diagnostics;
 };
 
 LlamaBackend::LlamaBackend(QObject* parent)
@@ -187,6 +194,8 @@ LlamaBackend::LlamaBackend(QObject* parent)
     , d(std::make_unique<Private>())
 {
     d->q = this;
+    // Имя backend'а известно сразу (диагностика до configure/загрузки).
+    d->diagnostics.backendName = QStringLiteral("llama.cpp");
 }
 
 LlamaBackend::~LlamaBackend() = default;
@@ -201,6 +210,13 @@ void LlamaBackend::configure(const QString& modelPath, int contextSize,
     d->modelPath = modelPath;
     d->contextSize = contextSize;
     d->gpuLayers = gpuLayers;
+
+    // Диагностика: имя модели — только файл, без внутренних путей
+    // (полное имя показывается в логах, в UI — имя файла GGUF).
+    QMutexLocker locker(&d->diagnosticsMutex);
+    d->diagnostics.modelName = QFileInfo(modelPath).fileName();
+    d->diagnostics.contextSize = contextSize;
+    d->diagnostics.gpuLayers = gpuLayers;
 }
 
 bool LlamaBackend::isModelLoaded() const
@@ -245,6 +261,20 @@ void LlamaBackend::cancel(quint64 requestId)
         d->cancelRequested.store(true);
 }
 
+BackendDiagnostics LlamaBackend::diagnostics() const
+{
+    // Короткая блокировка + копия: UI получает независимый снимок, даже
+    // пока worker пишет метрики; указателей/адресов в данных нет.
+    QMutexLocker locker(&d->diagnosticsMutex);
+    return d->diagnostics;
+}
+
+void LlamaBackend::setDiagnosticError(const QString& error)
+{
+    QMutexLocker locker(&d->diagnosticsMutex);
+    d->diagnostics.lastError = error;
+}
+
 void LlamaBackend::loadModel()
 {
     // Инициализация llama/ggml (f16-таблицы, загрузка бэкендов) — один
@@ -258,12 +288,20 @@ void LlamaBackend::loadModel()
         // сигнал успешной загрузки (setBackend потребителя идемпотентен).
         qCInfo(llamaLog) << "loadModel: модель уже загружена — повторная"
                          << "загрузка не выполняется";
+        setDiagnosticError(QString()); // модель работает — ошибок нет
         emit modelLoaded(d->modelPath, d->lastContextSize, 0);
         return;
     }
 
+    // Ошибки загрузки — в одну точку: сигнал + последняя ошибка
+    // диагностики (показывается в режиме диагностики).
+    const auto failLoad = [this](const QString& error) {
+        setDiagnosticError(error);
+        emit modelLoadFailed(error);
+    };
+
     if (d->modelPath.isEmpty()) {
-        emit modelLoadFailed(tr("Путь к GGUF-модели не задан"));
+        failLoad(tr("Путь к GGUF-модели не задан"));
         return;
     }
 
@@ -299,7 +337,7 @@ void LlamaBackend::loadModel()
             ? tr("Загрузка модели прервана")
             : tr("Не удалось загрузить GGUF-модель: %1").arg(d->modelPath);
         qCWarning(llamaLog) << "загрузка модели не удалась:" << error;
-        emit modelLoadFailed(error);
+        failLoad(error);
         return;
     }
     d->model = llama_model_ptr(rawModel);
@@ -323,12 +361,19 @@ void LlamaBackend::loadModel()
             tr("Не удалось создать контекст llama.cpp (n_ctx=%1)").arg(nCtx);
         qCWarning(llamaLog) << error;
         d->model.reset(); // освобождаем модель сразу, контекста нет
-        emit modelLoadFailed(error);
+        failLoad(error);
         return;
     }
     d->context = llama_context_ptr(rawContext);
     d->lastContextSize = nCtx;
     d->loaded.store(true);
+    {
+        // Диагностика: фактический n_ctx; успешная загрузка разрешает
+        // последнюю ошибку.
+        QMutexLocker locker(&d->diagnosticsMutex);
+        d->diagnostics.contextSize = nCtx;
+        d->diagnostics.lastError.clear();
+    }
 
     const qint64 elapsedMs = timer.elapsed();
     qCInfo(llamaLog) << "модель загружена:" << d->modelPath
@@ -348,8 +393,15 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
     if (d->activeRequestId.load() != id)
         return;
 
+    // Ошибки генерации — в одну точку: сигнал + последняя ошибка
+    // диагностики (показывается в режиме диагностики).
+    const auto fail = [this, id](const QString& message) {
+        setDiagnosticError(message);
+        emit generationError(id, message);
+    };
+
     if (!d->loaded.load() || !d->model || !d->context) {
-        emit generationError(id, tr("Модель llama.cpp не загружена"));
+        fail(tr("Модель llama.cpp не загружена"));
         return;
     }
 
@@ -357,12 +409,20 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
     QElapsedTimer total;
     total.start();
 
+    // Метрики диагностики последнего УСПЕШНОГО запроса: заполняются по
+    // фазам ниже, в снимок уходят целиком в finish() (только worker).
+    qint64 diagPromptTokens = 0;
+    qint64 diagPromptMs = 0;
+    qint64 diagGenTokens = 0;
+    qint64 diagGenMs = 0;
+
     const auto cancelled = [this, id]() {
         return d->stopRequested.load() || d->cancelRequested.load()
             || d->activeRequestId.load() != id;
     };
-    const auto finish = [this, &total, id](const QString& stopReason,
-                                           const std::string& text) {
+    const auto finish = [this, &total, id, &diagPromptTokens, &diagPromptMs,
+                         &diagGenTokens, &diagGenMs](const QString& stopReason,
+                                                     const std::string& text) {
         GenerationResult result;
         result.requestId = id;
         // Копия в QString — указатель на локальную строку не сохраняется.
@@ -373,12 +433,23 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
                          << "символов:" << result.generatedText.size()
                          << "| причина:" << stopReason
                          << "| elapsedMs:" << result.elapsedMs;
+        {
+            // Снимок диагностики: метрики фаз текущего запроса; успех
+            // разрешает последнюю ошибку. Пишется ДО сигнала — потребитель
+            // увидит свежие цифры сразу после ответа.
+            QMutexLocker locker(&d->diagnosticsMutex);
+            d->diagnostics.promptTokens = diagPromptTokens;
+            d->diagnostics.generatedTokens = diagGenTokens;
+            d->diagnostics.promptProcessingMs = diagPromptMs;
+            d->diagnostics.generationMs = diagGenMs;
+            d->diagnostics.lastError.clear();
+        }
         emit generationReady(result);
     };
 
     const llama_vocab* vocab = llama_model_get_vocab(d->model.get());
     if (vocab == nullptr) {
-        emit generationError(id, tr("Словарь модели недоступен"));
+        fail(tr("Словарь модели недоступен"));
         return;
     }
 
@@ -387,7 +458,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
     // чат-шаблона (чат-шаблон — для chat-режима, отдельная задача).
     QByteArray promptText = request.context.toUtf8();
     if (promptText.trimmed().isEmpty()) {
-        emit generationError(id, tr("Пустой контекст — генерация невозможна"));
+        fail(tr("Пустой контекст — генерация невозможна"));
         return;
     }
     if (promptText.size() > kMaxPromptChars) {
@@ -410,7 +481,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
                         nullptr, 0, /*add_special*/ true,
                         /*parse_special*/ false);
     if (needed <= 0) {
-        emit generationError(id, tr("Ошибка токенизации промпта"));
+        fail(tr("Ошибка токенизации промпта"));
         return;
     }
     std::vector<llama_token> tokens(static_cast<std::size_t>(needed));
@@ -419,7 +490,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
                        tokens.data(), needed, /*add_special*/ true,
                        /*parse_special*/ false);
     if (tokenCount < 0) {
-        emit generationError(id, tr("Ошибка токенизации промпта"));
+        fail(tr("Ошибка токенизации промпта"));
         return;
     }
     tokens.resize(static_cast<std::size_t>(tokenCount));
@@ -431,8 +502,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
         qBound(1, request.maxTokens, kMaxGeneratedTokens);
     const int budget = nCtx - maxTokens - 16;
     if (budget < 1) {
-        emit generationError(id, tr("Контекст модели слишком мал: n_ctx=%1")
-                                     .arg(nCtx));
+        fail(tr("Контекст модели слишком мал: n_ctx=%1").arg(nCtx));
         return;
     }
     if (static_cast<int>(tokens.size()) > budget) {
@@ -442,6 +512,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
                      tokens.begin() + (tokens.size() - budget));
     }
     const int nPrompt = static_cast<int>(tokens.size());
+    diagPromptTokens = nPrompt; // метрика диагностики (см. finish)
     qCInfo(llamaLog) << "запрос" << id << ": prompt" << nPrompt
                      << "токенов | maxTokens:" << maxTokens
                      << "| n_ctx:" << nCtx;
@@ -477,13 +548,14 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
         ++chunks;
     }
     if (promptFailed) {
-        emit generationError(id, tr("Ошибка обработки промпта (llama_decode)"));
+        fail(tr("Ошибка обработки промпта (llama_decode)"));
         return;
     }
     if (promptCancelled) {
         finish(QStringLiteral("cancelled"), {});
         return;
     }
+    diagPromptMs = promptTimer.elapsed(); // метрика диагностики
     qCInfo(llamaLog) << "запрос" << id << ": prompt processing" << nPrompt
                      << "токенов за" << promptTimer.elapsed() << "мс | чанков:"
                      << chunks;
@@ -492,7 +564,7 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
     llama_sampler_ptr sampler(
         llama_sampler_chain_init(llama_sampler_chain_default_params()));
     if (!sampler) {
-        emit generationError(id, tr("Не удалось создать цепочку сэмплера"));
+        fail(tr("Не удалось создать цепочку сэмплера"));
         return;
     }
     const float topP =
@@ -537,12 +609,13 @@ void LlamaBackend::generateInWorker(const GenerationRequest& request)
         const llama_token decoded[1] = { token };
         fillBatch(batch.batch, decoded, 1, nPrompt + step, /*logits*/ true);
         if (llama_decode(d->context.get(), batch.batch) != 0) {
-            emit generationError(id,
-                                 tr("Ошибка генерации (llama_decode)"));
+            fail(tr("Ошибка генерации (llama_decode)"));
             return;
         }
     }
 
+    diagGenTokens = generatedTokens; // метрики диагностики (см. finish)
+    diagGenMs = genTimer.elapsed();
     qCInfo(llamaLog) << "запрос" << id << ": генерация" << generatedTokens
                      << "токенов за" << genTimer.elapsed() << "мс";
 

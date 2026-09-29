@@ -94,6 +94,22 @@ Qt 6 desktop-текстовый редактор с AI-подсказками (M
     изменении пути/контекста/GPU-слоёв и безопасным свапом
     (контроллер → mock: cancel + bump id → остановка старого потока →
     новый backend с новыми настройками, пока он грузится — mock).
+- **Диагностика backend'а** — кнопка **Diagnostics** в панели →
+  `DiagnosticsDialog` со снимком активного backend'а:
+  - поля: имя backend'а, имя модели (только файл GGUF), размер
+    контекста, число GPU-слоёв, prompt/generated токены, время
+    обработки prompt'а, время генерации, токенов в секунду и
+    последняя ошибка; метрики — последнего **успешного** запроса,
+    пустые поля показываются как «—»;
+  - кнопка **Копировать** кладёт текстовый отчёт в буфер обмена;
+    отчёт формируется строго из полей снимка — **без указателей и
+    внутренних адресов** (контролируется тестом);
+  - снимок фиксируется при открытии диалога; данные собирает сам
+    backend — `ITextGenerationBackend::diagnostics()`,
+    потокобезопасная копия под мьютексом (UI не блокируется);
+  - **режим отключаем**: опция `PTUCH_DIAGNOSTICS` (по умолчанию ON
+    в Debug, OFF в Release) вырезает кнопку, диалог и их тесты —
+    см. «Сборка»; API `diagnostics()` и метрики остаются.
 
 ## Структура
 
@@ -105,10 +121,13 @@ src/
   UI/
     MainWindow.h / .cpp         # central QPlainTextEdit, toolbar, статусная строка, wiring
                                 # (mock + llama: setupLlamaBackend/stopLlamaWorker;
-                                #  настройки: openSettings/applySettings/reloadLlamaBackend)
+                                #  настройки: openSettings/applySettings/reloadLlamaBackend;
+                                #  диагностика: openDiagnostics — под PTUCH_DIAGNOSTICS)
     suggestion_overlay.h / .cpp # ghost-подсказка поверх viewport'а (документ не трогает)
     settings_dialog.h / .cpp    # SettingsDialog: поля с диапазонами, выбор файла,
                                 # Test Model на временном LlamaBackend (свой поток)
+    diagnostics_dialog.h / .cpp # DiagnosticsDialog: снимок BackendDiagnostics + копирование
+                                # отчёта в буфер (сборка только при PTUCH_DIAGNOSTICS=ON)
   settings/
     app_settings.h / .cpp       # AppSettings: единый источник ключей/дефолтов/диапазонов
                                 # QSettings + sanitize() (защита от мусора)
@@ -117,6 +136,7 @@ src/
                                 # (pimpl, worker-поток, RAII, отмена, логи ptuch.llama)
   backend/
     text_generation_backend.h   # ITextGenerationBackend + GenerationRequest/Result
+                                # + BackendDiagnostics (снимок для диагностики)
     mock_text_generation_backend.h/.cpp # mock: задержка, ошибка, отмена,
                                  # живёт в отдельном (не UI) потоке
   suggestion/
@@ -133,6 +153,7 @@ tests/
   llama_backend_test.cpp       # Qt Test: контракт LlamaBackend + smoke с GGUF
   settings_test.cpp            # Qt Test: AppSettings (дефолты/roundtrip/санитизация)
                                # + SettingsDialog (диапазоны, ошибка Test Model)
+                               # + диагностика (отчёт, диалог, буфер обмена)
 models/                         # *.gguf (в .gitignore)
 third_party/
   llama.cpp/                    # вендор (не редактируется)
@@ -154,6 +175,22 @@ cmake --build build -j
 
 Для кода проекта включены `-Wall -Wextra` (MSVC: `/W4`).
 На third_party (`llama.cpp`, `ggml`) предупреждения **не** распространяются.
+
+### Режим диагностики (PTUCH_DIAGNOSTICS)
+
+Кнопка **Diagnostics**, `diagnostics_dialog.*` и тесты диагностики
+собираются под опцией `PTUCH_DIAGNOSTICS` — по умолчанию `ON` в Debug
+и `OFF` в Release (переключается явно):
+
+```bash
+cmake -S . -B build ... -DPTUCH_DIAGNOSTICS=OFF  # выключить в Debug
+cmake -S . -B build ... -DPTUCH_DIAGNOSTICS=ON   # включить в Release
+```
+
+При выключении UI-часть вырезается полностью: файлы диалога не
+включаются в сборку, кнопка не создаётся, слоты тестов уходят в
+`QSKIP`. `ITextGenerationBackend::diagnostics()` и сбор метрик
+остаются (дешёвая инструментация — полезна и в журналах Release).
 
 ## Тесты
 
@@ -211,7 +248,11 @@ PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диа
   отклоняет без изменения документа. Слот
   `settingsDialogAppliesAndPersists` открывает диалог кнопкой
   **Settings**, меняет debounce/авто и проверяет: контроллер получил
-  новые значения, `QSettings` сохранил их. Отдельный слот
+  новые значения, `QSettings` сохранил их. Слот
+  `diagnosticsButtonOpensDialog` (при `PTUCH_DIAGNOSTICS=ON`, иначе
+  `QSKIP`) открывает диалог кнопкой **Diagnostics**, проверяет снимок
+  mock-бэкенда («mock», у модели «—») и копирование отчёта в буфер
+  без адресов. Отдельный слот
   `mainWindowLoadsRealModelAndClosesCleanly` (под `PTUCH_MODEL_TESTS=1`)
   грузит реальную GGUF через `MainWindow` и закрывает окно — проверка
   `closeEvent → stopLlamaWorker → RAII`-освобождения.
@@ -219,9 +260,13 @@ PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диа
   возвращается), ошибка «модель не загружена» с эхо `requestId`,
   асинхронность `generate()` из чужого потока (queued-диспетчеризация:
   сразу после вызова ответа нет), безопасная отмена неизвестного id.
-  Smoke под `PTUCH_MODEL_TESTS=1`: загрузка GGUF в worker-потоке
-  (проверка потока исполнения сигналом), генерация (непустой текст,
-  `elapsedMs`, допустимые `stopReason`), идемпотентный повтор
+  Диагностика: `diagnostics()` после `configure()` (имя модели — только
+  файл, n_ctx/GPU-слои, пустая ошибка, нулевые метрики) и фиксация
+  последней ошибки генерации в снимке. Smoke под `PTUCH_MODEL_TESTS=1`:
+  загрузка GGUF в worker-потоке (проверка потока исполнения сигналом),
+  генерация (непустой текст, `elapsedMs`, допустимые `stopReason`),
+  метрики последнего успешного запроса в снимке (prompt/generated
+  токены, времена фаз, пустая ошибка), идемпотентный повтор
   `loadModel()`, отмена → `stopReason="cancelled"`.
 - `Settings` — дефолты при пустом `QSettings`, roundtrip
   «сохранил → новый запуск → загрузил» (в т.ч. ключ `llama/modelPath`
@@ -235,6 +280,11 @@ PTUCH_MODEL_TESTS=1 ./build/SettingsTests               # + Test Model в диа
   `suggestion/*`) — чужие ключи файла (fallback `NSGlobalDomain`)
   не затираются и не копируются. Под `PTUCH_MODEL_TESTS=1` — Test Model
   с реальной моделью до состояния `OK:`.
+- `Диагностика` (слоты `QSKIP` при `PTUCH_DIAGNOSTICS=OFF`) —
+  форматирование отчёта: все поля снимка, посчитанные «токенов в
+  секунду», «—» для пустых значений, отсутствие адресов `0x`; диалог:
+  метки соответствуют полям снимка, кнопка **Копировать** кладёт отчёт
+  в буфер обмена.
 
 Снимок ghost-подсказки для ручного просмотра (по желанию):
 
@@ -311,6 +361,16 @@ open build/PtuchEditor.app
   изменении** (безопасным свапом, активная генерация корректно
   завершается как устаревшая); остальные параметры — сразу, без
   отмены запроса.
+
+### Диагностика (кнопка Diagnostics)
+
+Кнопка **Diagnostics** в верхней панели (собирается при
+`PTUCH_DIAGNOSTICS=ON`) открывает `DiagnosticsDialog` — снимок
+активного backend'а на момент открытия: имя backend'а и модели,
+`n_ctx`, GPU-слои, prompt/generated токены, времена фаз,
+токенов в секунду и последняя ошибка. Кнопка **Копировать** кладёт
+тот же отчёт в буфер обмена; пустые поля отображаются как «—».
+Новые цифры — после новых запросов (закрыть и открыть снова).
 
 ## Стандарт и автогенерация Qt
 

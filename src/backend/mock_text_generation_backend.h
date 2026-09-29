@@ -33,6 +33,10 @@ public:
     // ITextGenerationBackend
     void generate(const GenerationRequest& request) override;
     void cancel(quint64 requestId) override;
+    // Диагностика: константный снимок («mock», модель и метрики
+    // отсутствуют — UI показывает «—»). Потокобезопасен: разделяемого
+    // состояния нет.
+    BackendDiagnostics diagnostics() const override;
 
 private:
     // Ниже — только в потоке объекта.

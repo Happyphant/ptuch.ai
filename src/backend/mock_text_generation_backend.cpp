@@ -60,6 +60,17 @@ void MockTextGenerationBackend::cancel(quint64 requestId)
         Qt::QueuedConnection);
 }
 
+BackendDiagnostics MockTextGenerationBackend::diagnostics() const
+{
+    // Модели и настоящих токенов у mock нет: modelName/promptTokens/...
+    // остаются нулевыми, и UI рисует для них «—» (см.
+    // DiagnosticsDialog::formatReport). Состояние не разделяется —
+    // вызов безопасен из любого потока без блокировок.
+    BackendDiagnostics data;
+    data.backendName = QStringLiteral("mock");
+    return data;
+}
+
 void MockTextGenerationBackend::scheduleFinish(GenerationRequest request)
 {
     const qint64 startedAt = QDateTime::currentMSecsSinceEpoch();

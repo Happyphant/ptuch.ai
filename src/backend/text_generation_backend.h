@@ -40,8 +40,28 @@ struct GenerationResult
     qint64 elapsedMs = 0;
 };
 
+// Снимок диагностики backend'а (режим диагностики в UI): состояние
+// последнего успешного запроса + последняя ошибка.
+//
+// Только доменные значения — без указателей, адресов и внутренних
+// структур backend'а: отображаемый/копируемый текст форматируется
+// строго из этих полей (см. DiagnosticsDialog::formatReport).
+struct BackendDiagnostics
+{
+    QString backendName;        // "llama.cpp" | "mock" (пусто = н/д)
+    QString modelName;          // имя файла GGUF; пусто = модели нет
+    int contextSize = 0;        // n_ctx (настроенный/фактический)
+    int gpuLayers = 0;          // -1 = все слои на GPU
+    qint64 promptTokens = 0;    // токены последнего успешного prompt'а
+    qint64 generatedTokens = 0; // сгенерировано последним запросом
+    qint64 promptProcessingMs = 0; // время обработки prompt'а (мс)
+    qint64 generationMs = 0;    // время генерации (мс)
+    QString lastError;          // последняя ошибка (пусто = нет)
+};
+
 Q_DECLARE_METATYPE(GenerationRequest)
 Q_DECLARE_METATYPE(GenerationResult)
+Q_DECLARE_METATYPE(BackendDiagnostics)
 
 // Абстракция AI-backend'а генерации текста.
 //
@@ -78,6 +98,13 @@ public:
     // Просьба прекратить генерацию requestId (может быть проигнорирована
     // — см. договорённость про сверку requestId выше).
     virtual void cancel(quint64 requestId) = 0;
+
+    // Режим диагностики: независимый снимок состояния backend'а.
+    // Разрешён из любого потока (вызывается из UI): реализация обязана
+    // вернуть КОПИЮ под своим синхронизирующим объектом — короткая
+    // блокировка, без обращения к внутренним указателям и без
+    // длительного удержания (UI не блокируется).
+    virtual BackendDiagnostics diagnostics() const = 0;
 
 signals:
     void generationReady(const GenerationResult& result);

@@ -28,6 +28,7 @@ private slots:
     void generate_withoutModel_reportsError();
     void generate_fromForeignThread_isAsync();
     void cancel_unknownId_keepsBackendUsable();
+    void diagnostics_reportsModelInfo();
     void modelSmoke_realGguf();
 
 private:
@@ -104,6 +105,12 @@ void LlamaBackendTest::generate_withoutModel_reportsError()
     const QString message = errorSpy.first().at(1).toString();
     QVERIFY2(message.contains(QStringLiteral("не загружена")),
              qPrintable(message));
+
+    // Диагностика: ошибка генерации зафиксирована в снимке — текстом,
+    // без указателей/адресов (так и показывается в UI).
+    const BackendDiagnostics diag = m_backend->diagnostics();
+    QVERIFY2(diag.lastError.contains(QStringLiteral("не загружена")),
+             qPrintable(diag.lastError));
 }
 
 void LlamaBackendTest::generate_fromForeignThread_isAsync()
@@ -153,6 +160,25 @@ void LlamaBackendTest::cancel_unknownId_keepsBackendUsable()
 
     QCOMPARE(errorSpy.count(), 1);
     QCOMPARE(errorSpy.first().at(0).toULongLong(), quint64(9));
+}
+
+void LlamaBackendTest::diagnostics_reportsModelInfo()
+{
+    // configure() фиксирует имя модели и параметры — уже без загрузки
+    // (файл не создаётся и не читается): имя в снимке — только файл GGUF.
+    m_backend->configure(QStringLiteral("/tmp/some-model.gguf"),
+                         /*contextSize*/ 4096, /*gpuLayers*/ -1);
+
+    const BackendDiagnostics diag = m_backend->diagnostics();
+    QCOMPARE(diag.backendName, QStringLiteral("llama.cpp"));
+    QCOMPARE(diag.modelName, QStringLiteral("some-model.gguf"));
+    QCOMPARE(diag.contextSize, 4096);
+    QCOMPARE(diag.gpuLayers, -1);
+    QVERIFY(diag.lastError.isEmpty());
+    // Генерации ещё не было — метрики нулевые (UI покажет «—»).
+    QCOMPARE(diag.promptTokens, qint64(0));
+    QCOMPARE(diag.generatedTokens, qint64(0));
+    QCOMPARE(diag.generationMs, qint64(0));
 }
 
 void LlamaBackendTest::modelSmoke_realGguf()
@@ -239,6 +265,24 @@ void LlamaBackendTest::modelSmoke_realGguf()
     QVERIFY(result.elapsedMs > 0);
     // Инференс (llama_decode/sampling) — в worker-потоке, не в UI.
     QCOMPARE(readyThread, &worker);
+
+    // Диагностика: метрики последнего успешного запроса заполнены —
+    // ровно то, что показывает режим Diagnostics (после отмены ниже
+    // снимок обновится метриками отменённого запроса).
+    const BackendDiagnostics diag = m_backend->diagnostics();
+    QCOMPARE(diag.backendName, QStringLiteral("llama.cpp"));
+    QCOMPARE(diag.modelName, QFileInfo(modelPath).fileName());
+    QCOMPARE(diag.contextSize, 2048);
+    QVERIFY2(diag.promptTokens > 0,
+             "Prompt tokens не записаны в снимок");
+    QVERIFY2(diag.generatedTokens > 0,
+             "Generated tokens не записаны в снимок");
+    QVERIFY2(diag.promptProcessingMs > 0,
+             "Время обработки prompt'а не записано в снимок");
+    QVERIFY2(diag.generationMs > 0,
+             "Время генерации не записано в снимок");
+    QVERIFY2(diag.lastError.isEmpty(),
+             qPrintable(diag.lastError));
 
     // Модель загружается один раз: повторный loadModel() не перегружает
     // (elapsedMs == 0 в сигнале), isModelLoaded остаётся true.
