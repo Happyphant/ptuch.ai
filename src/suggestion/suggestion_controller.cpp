@@ -2,8 +2,36 @@
 #include "suggestion_controller.h"
 
 #include <QDateTime>
+#include <QLoggingCategory>
 
 #include <utility>
+
+// Логирование переходов состояний (и гонок: отмены/устаревшие ответы).
+// Видно по умолчанию (info) — как у ptuch.llama:
+//   grep ptuch.suggestion
+Q_LOGGING_CATEGORY(suggestionLog, "ptuch.suggestion")
+
+namespace {
+
+// Имя состояния для логов/диагностики (соответствует enum State).
+QString stateName(SuggestionController::State state)
+{
+    switch (state) {
+    case SuggestionController::State::Idle:
+        return QStringLiteral("Idle");
+    case SuggestionController::State::Debouncing:
+        return QStringLiteral("Debouncing");
+    case SuggestionController::State::Generating:
+        return QStringLiteral("Generating");
+    case SuggestionController::State::Ready:
+        return QStringLiteral("Ready");
+    case SuggestionController::State::Error:
+        return QStringLiteral("Error");
+    }
+    return QStringLiteral("?");
+}
+
+} // namespace
 
 SuggestionController::SuggestionController(ISuggestionEditor* editor,
                                            QObject* parent)
@@ -99,6 +127,13 @@ void SuggestionController::setStyleMix(QVector<StyleWeight> mix)
     scheduleRequest();
 }
 
+void SuggestionController::setStyleProfiles(QVector<StyleProfile> profiles)
+{
+    // Только вход проверки адаптеров: без сбросов состояния — активный
+    // mix/запрос от списка профилей не зависят (см. header).
+    m_styleProfiles = std::move(profiles);
+}
+
 void SuggestionController::setEnabled(bool enabled)
 {
     if (m_enabled == enabled)
@@ -150,6 +185,28 @@ void SuggestionController::onCursorPositionChanged()
     scheduleRequest();
 }
 
+void SuggestionController::onFocusLost()
+{
+    // Потеря фокуса (клик по панели/кнопке, диалог, переключение окна):
+    // подсказка в неактивном редакторе принять нечем (Tab уже не про
+    // редактор) — прячем её, гасим debounce и отменяем запрос «в полёте».
+    // Ручной запрос, стартовавший БЕЗ фокуса (Generate), не затрагивается:
+    // FocusOut предшествует clicked, отменять пока нечего.
+    if (!m_enabled)
+        return;
+
+    qCInfo(suggestionLog).noquote()
+        << QStringLiteral(
+               "focus: потеря фокуса — debounce остановлен, подсказка "
+               "скрыта, активный запрос отменён");
+
+    m_debounceTimer.stop();
+    cancelCurrentRequest();
+    clearSuggestion();
+    m_alternativeIndex = 0;
+    setState(State::Idle);
+}
+
 void SuggestionController::scheduleRequest()
 {
     m_debounceTimer.stop();
@@ -189,6 +246,10 @@ void SuggestionController::cancelCurrentRequest()
     //  1) вежливая отмена — cancel(requestId) к backend'у;
     //  2) bump generation id — если backend проигнорирует отмену,
     //     его ответ всё равно не пройдёт сверку requestId.
+    qCInfo(suggestionLog).noquote()
+        << QStringLiteral("cancel: активный запрос id=%1 отменён")
+               .arg(m_generationId);
+
     if (m_backend != nullptr)
         m_backend->cancel(m_generationId);
 
@@ -257,6 +318,38 @@ bool SuggestionController::startRequest(bool requireFocus,
     if (requireFocus && !m_editor->hasFocus())
         return fail(tr("Редактор не в фокусе"));
 
+    // --- Адаптеры (LoRA): явные ошибки вместо тихого игнора -------------
+    // В MVP активный профиль с adapterPath неприменим: текущие бэкенды
+    // адаптеров не поддерживают (supportsAdapters() == false), а
+    // настоящее наложение LoRA требует отдельного inference backend'а
+    // (см. README «Стили и LoRA-адаптеры»). Отклоняем ДО отправки —
+    // запрос к backend'у не уходит.
+    const StyleProfile* adapterProfile =
+        findActiveAdapter(m_styleProfiles, m_styles);
+    if (adapterProfile != nullptr) {
+        const BackendDiagnostics diag = m_backend->diagnostics();
+
+        if (!m_backend->supportsAdapters()) {
+            const QString backendName =
+                diag.backendName.isEmpty() ? tr("без имени")
+                                           : diag.backendName;
+            return fail(
+                tr("Стиль «%1» объявляет адаптер (%2), но бэкенд «%3» не "
+                   "поддерживает adapterPath — в MVP стили применяются "
+                   "через микширование prompt")
+                    .arg(adapterProfile->displayName,
+                         adapterProfile->adapterPath,
+                         backendName));
+        }
+
+        const QString incompatible =
+            checkAdapterCompatibility(*adapterProfile, diag.modelName);
+        if (!incompatible.isEmpty())
+            return fail(
+                tr("Стиль «%1»: несовместимость адаптера — %2")
+                    .arg(adapterProfile->displayName, incompatible));
+    }
+
     // Прежний запрос (если был «в полёте») отменяется/помечается
     // устаревшим.
     cancelCurrentRequest();
@@ -292,6 +385,17 @@ bool SuggestionController::startRequest(bool requireFocus,
     request.topP = m_topP;
     request.styleWeights = context.styles;
 
+    // Адаптер дошёл до отправки только при поддерживаемом backend'е и
+    // после успешной проверки совместимости — заполняем нейтральный
+    // контракт AdapterSpec (сама загрузка — работа backend'а).
+    if (adapterProfile != nullptr) {
+        request.adapter.path = adapterProfile->adapterPath;
+        request.adapter.type = adapterProfile->adapterType;
+        request.adapter.baseModelId = adapterProfile->baseModelId;
+        request.adapter.promptTag = adapterProfile->promptTag;
+        request.adapter.scale = adapterProfile->adapterScale;
+    }
+
     // Асинхронно: вызов лишь ставит работу в очередь backend'а,
     // UI не блокируется.
     m_backend->generate(request);
@@ -305,8 +409,16 @@ void SuggestionController::onGenerationReady(const GenerationResult& result)
     // в любом случае generation id уже не совпадает.
     if (!m_enabled ||
         !m_requestInProgress ||
-        result.requestId != m_generationId)
+        result.requestId != m_generationId) {
+        qCInfo(suggestionLog).noquote()
+            << QStringLiteral(
+                   "stale: ответ id=%1 отброшен (текущий id=%2, "
+                   "в полёте=%3)")
+                   .arg(result.requestId)
+                   .arg(m_generationId)
+                   .arg(int(m_requestInProgress));
         return;
+    }
 
     m_requestInProgress = false;
 
@@ -329,8 +441,16 @@ void SuggestionController::onGenerationError(quint64 requestId,
     // Ошибка устаревшего запроса никого не интересует.
     if (!m_enabled ||
         !m_requestInProgress ||
-        requestId != m_generationId)
+        requestId != m_generationId) {
+        qCInfo(suggestionLog).noquote()
+            << QStringLiteral(
+                   "stale: ошибка id=%1 отброшена (текущий id=%2, "
+                   "в полёте=%3)")
+                   .arg(requestId)
+                   .arg(m_generationId)
+                   .arg(int(m_requestInProgress));
         return;
+    }
 
     m_requestInProgress = false;
 
@@ -455,6 +575,14 @@ void SuggestionController::setState(State state)
     if (m_state == state)
         return;
 
+    // Лог перехода состояний: единая точка — любой сдвиг machine
+    // виден в журнале (ptuch.suggestion), с generation id для
+    // отладки гонок «новый запрос vs отмена vs старый ответ».
+    const State previous = m_state;
     m_state = state;
+    qCInfo(suggestionLog).noquote()
+        << QStringLiteral("state: %1 -> %2 (id=%3)")
+               .arg(stateName(previous), stateName(state))
+               .arg(m_generationId);
     emit stateChanged(state);
 }

@@ -41,6 +41,12 @@ private slots:
     void instructionIsCompactPerActiveProfile();
     void instructionExcludesProfileWithoutText();
     void instructionDoesNotGrowWithRepeatedCalls();
+
+    // Опциональные поля LoRA-адаптеров (данные под будущий
+    // adapter-capable backend; MVP их не использует).
+    void adapterFieldsDefaultToNoAdapter();
+    void adapterCompatibilityErrors();
+    void findActiveAdapterPicksActiveProfile();
 };
 
 namespace {
@@ -312,6 +318,114 @@ void StyleMixerTest::instructionDoesNotGrowWithRepeatedCalls()
     QVERIFY(changed != first);
     QVERIFY(changed.contains(QStringLiteral("0.25"))); // 0.1 / (0.1+0.3)
     QVERIFY(changed.contains(QStringLiteral("0.75"))); // 0.3 / (0.1+0.3)
+}
+
+// Опциональные поля адаптеров: у встроенных профилей они пусты —
+// текущий GGUF-бэкенд работает без изменений; hasAdapter зависит
+// только от непустого adapterPath, adapterScale по умолчанию 1.0.
+void StyleMixerTest::adapterFieldsDefaultToNoAdapter()
+{
+    const QVector<StyleProfile> profiles = builtinStyleProfiles();
+    QCOMPARE(profiles.size(), 4);
+
+    for (const StyleProfile& profile : profiles) {
+        QVERIFY2(!hasAdapter(profile), qPrintable(profile.id));
+        QVERIFY(profile.adapterPath.isEmpty());
+        QVERIFY(profile.adapterType.isEmpty());
+        QVERIFY(profile.baseModelId.isEmpty());
+        QVERIFY(profile.promptTag.isEmpty());
+        QCOMPARE(profile.adapterScale, 1.0);
+    }
+
+    // Прочие поля без adapterPath адаптера не объявляют.
+    StyleProfile typeOnly;
+    typeOnly.adapterType = QStringLiteral("lora");
+    typeOnly.baseModelId = QStringLiteral("qwen2.5-3b");
+    QVERIFY(!hasAdapter(typeOnly));
+
+    // Признак «адаптер объявлен» — ровно непустой путь.
+    StyleProfile withPath;
+    withPath.adapterPath = QStringLiteral("/models/x-lora.safetensors");
+    QVERIFY(hasAdapter(withPath));
+}
+
+// Совместимость адаптера с базовой моделью backend'а: строгие ошибки
+// вместо тихого «пропустить» — несовместимость видна ДО инференса.
+void StyleMixerTest::adapterCompatibilityErrors()
+{
+    StyleProfile profile;
+    profile.adapterPath = QStringLiteral("/models/a-lora.safetensors");
+
+    // Адаптера нет — проверять нечего (backend работает без адаптеров),
+    // даже если базовая модель backend'а известна.
+    StyleProfile withoutAdapter;
+    QCOMPARE(
+        checkAdapterCompatibility(withoutAdapter,
+                                  QStringLiteral("any-model")),
+        QString());
+
+    // У адаптера не указана базовая модель — «не проверено», ошибка.
+    QString error =
+        checkAdapterCompatibility(profile, QStringLiteral("other-model"));
+    QVERIFY2(error.contains(QStringLiteral("baseModelId")),
+             qPrintable(error));
+    profile.baseModelId = QStringLiteral("qwen2.5-3b");
+
+    // Базовая модель backend'а неизвестна — «не проверено», ошибка
+    // (сам adapterPath в тексте не участвует — только идентификаторы).
+    error = checkAdapterCompatibility(profile, QString());
+    QVERIFY2(error.contains(QStringLiteral("неизвестна")), qPrintable(error));
+
+    // Несовместимость: адаптер обучен под «qwen2.5-3b», загружена
+    // другая модель — обе стороны видны в тексте ошибки.
+    error = checkAdapterCompatibility(profile, QStringLiteral("other-7b"));
+    QVERIFY2(error.contains(QStringLiteral("qwen2.5-3b")), qPrintable(error));
+    QVERIFY2(error.contains(QStringLiteral("other-7b")), qPrintable(error));
+
+    // Совпадение без учёта регистра — совместимо.
+    QCOMPARE(checkAdapterCompatibility(profile, QStringLiteral("QWEN2.5-3B")),
+             QString());
+}
+
+// Активный адаптер = непустой adapterPath + enabled + присутствие в
+// нормализованных весах активных стилей с весом > 0; nullptr = нет.
+void StyleMixerTest::findActiveAdapterPicksActiveProfile()
+{
+    StyleProfile adapter;
+    adapter.id = QStringLiteral("styled");
+    adapter.adapterPath = QStringLiteral("/models/styled-lora.safetensors");
+    StyleProfile plain;
+    plain.id = QStringLiteral("plain");
+
+    const QVector<StyleProfile> profiles{adapter, plain};
+    const QVector<StyleWeight> weights{
+        StyleWeight{QStringLiteral("plain"), 0.4f},
+        StyleWeight{QStringLiteral("styled"), 0.6f},
+    };
+
+    // Первый (и единственный) активный профиль с адаптером.
+    const StyleProfile* found = findActiveAdapter(profiles, weights);
+    QVERIFY(found != nullptr);
+    QCOMPARE(found->id, QStringLiteral("styled"));
+
+    // Профилю нет места в активных весах — активного адаптера нет.
+    const QVector<StyleWeight> plainOnly{
+        StyleWeight{QStringLiteral("plain"), 1.0f}};
+    QVERIFY(findActiveAdapter(profiles, plainOnly) == nullptr);
+
+    // Выключенный профиль не активен, даже если веса его содержат.
+    StyleProfile disabled = adapter;
+    disabled.enabled = false;
+    const QVector<StyleProfile> disabledProfiles{disabled, plain};
+    QVERIFY(findActiveAdapter(disabledProfiles, weights) == nullptr);
+
+    // Нулевой вес — профиль не активен.
+    const QVector<StyleWeight> zeroWeight{
+        StyleWeight{QStringLiteral("styled"), 0.0f}};
+    QVERIFY(findActiveAdapter(profiles, zeroWeight) == nullptr);
+
+    // Без профилей — нечего искать.
+    QVERIFY(findActiveAdapter(QVector<StyleProfile>(), weights) == nullptr);
 }
 
 QTEST_GUILESS_MAIN(StyleMixerTest)

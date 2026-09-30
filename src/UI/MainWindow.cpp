@@ -4,6 +4,7 @@
 #if PTUCH_DIAGNOSTICS
 #include "diagnostics_dialog.h"
 #endif
+#include "document/text_file_io.h"
 #include "llama/llama_backend.h"
 #include "settings/app_settings.h"
 #include "settings_dialog.h"
@@ -11,14 +12,21 @@
 #include "suggestion/suggestion_controller.h"
 #include "style_panel.h"
 #include "suggestion_overlay.h"
+#include "theme.h"
 
+#include <QAction>
+#include <QApplication>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDockWidget>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QStatusBar>
@@ -29,15 +37,21 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
+    // Снимок системной палитры ДО первой темизации: схема default
+    // возвращает к нему цвета шрифтов и контролов (см. applyTheme).
+    m_systemPalette = qApp->palette();
+
     setWindowTitle(QStringLiteral("Ptuch Editor"));
     resize(1000, 700);
 
     createEditor();
     createStatusPanel();
+    createFileMenu();
     createStylePanel();
     setupController();
 
     applyStyle();
+    updateDocumentIndicator();
     updateStateIndicator(m_controller->state());
 }
 
@@ -130,6 +144,12 @@ void MainWindow::createStatusPanel()
                           QStringLiteral("Режим 3"),
                           QStringLiteral("Режим 4")});
     bar->addWidget(m_comboBox);
+
+    // Имя файла + modified state (правый край; текст — updateDocumentIndicator).
+    m_documentIndicator = new QLabel(bar);
+    m_documentIndicator->setObjectName("documentIndicator");
+    m_documentIndicator->setAlignment(Qt::AlignCenter);
+    bar->addWidget(m_documentIndicator);
 }
 
 void MainWindow::createStylePanel()
@@ -145,6 +165,201 @@ void MainWindow::createStylePanel()
     dock->setWidget(m_stylePanel);
 
     addDockWidget(Qt::RightDockWidgetArea, dock);
+}
+
+void MainWindow::createFileMenu()
+{
+    // Команды документа в меню «Файл» (на macOS уходит в системное
+    // меню). Горячие клавиши весят на QAction: Ctrl+N/O/S —
+    // QKeySequence::New/Open/Save (на macOS — Cmd), Save As —
+    // SaveAs (Ctrl+Shift+S). Контекст QAction — окно: работает,
+    // пока оно активно.
+    QMenu* fileMenu = menuBar()->addMenu(tr("Файл"));
+
+    QAction* newAction = fileMenu->addAction(
+        tr("Новый"), QKeySequence::New, this, &MainWindow::newDocument);
+    newAction->setObjectName(QStringLiteral("actionNew"));
+
+    QAction* openAction = fileMenu->addAction(
+        tr("Открыть..."), QKeySequence::Open, this,
+        &MainWindow::openDocumentDialog);
+    openAction->setObjectName(QStringLiteral("actionOpen"));
+
+    fileMenu->addSeparator();
+
+    QAction* saveAction = fileMenu->addAction(
+        tr("Сохранить"), QKeySequence::Save, this,
+        &MainWindow::saveDocument);
+    saveAction->setObjectName(QStringLiteral("actionSave"));
+
+    QAction* saveAsAction = fileMenu->addAction(
+        tr("Сохранить как..."), QKeySequence::SaveAs, this,
+        &MainWindow::saveDocumentAsDialog);
+    saveAsAction->setObjectName(QStringLiteral("actionSaveAs"));
+}
+
+// --- Документ v1: UTF-8 plain text -------------------------------------
+
+bool MainWindow::maybeSave()
+{
+    if (m_editor == nullptr ||
+        !m_editor->document()->isModified())
+        return true;
+
+    const QString name = m_filePath.isEmpty()
+        ? tr("Без имени")
+        : QFileInfo(m_filePath).fileName();
+
+    const QMessageBox::StandardButton choice = QMessageBox::warning(
+        this,
+        tr("Несохранённые изменения"),
+        tr("Документ «%1» изменён. Сохранить изменения?").arg(name),
+        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
+        QMessageBox::Save);
+
+    if (choice == QMessageBox::Save)
+        return saveDocument(); // ошибка записи/отмена Save As -> false
+    if (choice == QMessageBox::Cancel)
+        return false;
+    return true; // Discard — продолжаем без сохранения
+}
+
+void MainWindow::newDocument()
+{
+    if (!maybeSave())
+        return;
+
+    setDocumentText(QString(), QString());
+    statusBar()->showMessage(tr("Новый документ"));
+}
+
+bool MainWindow::openFile(const QString& path)
+{
+    // Подтверждение ДО чтения: при ошибке чтения текст не потерян.
+    if (!maybeSave())
+        return false;
+
+    const TextLoadResult loaded = TextFileIO::loadUtf8(path);
+    if (!loaded.ok) {
+        QMessageBox::warning(
+            this, tr("Ошибка открытия"),
+            tr("Не удалось открыть файл «%1»:\n%2")
+                .arg(path, loaded.error));
+        return false;
+    }
+
+    setDocumentText(loaded.text, path);
+    statusBar()->showMessage(tr("Открыто: %1").arg(path));
+    return true;
+}
+
+bool MainWindow::openDocumentDialog()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Открыть файл"),
+        m_filePath.isEmpty() ? QString()
+                             : QFileInfo(m_filePath).absolutePath(),
+        tr("Текстовые файлы (*.txt);;Все файлы (*)"));
+
+    if (path.isEmpty())
+        return false; // отмена диалога
+    return openFile(path);
+}
+
+bool MainWindow::saveDocument()
+{
+    if (m_filePath.isEmpty())
+        return saveDocumentAsDialog(); // файла ещё нет — Save As
+    return writeFile(m_filePath);
+}
+
+bool MainWindow::saveFileTo(const QString& path)
+{
+    // Ядро Save As: путь фиксируется только после УСПЕШНОЙ записи —
+    // сбой записи оставляет прежнее имя файла.
+    if (!writeFile(path))
+        return false;
+
+    m_filePath = path;
+    updateDocumentIndicator();
+    return true;
+}
+
+bool MainWindow::saveDocumentAsDialog()
+{
+    QFileDialog dialog(this, tr("Сохранить как"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setNameFilter(
+        tr("Текстовые файлы (*.txt);;Все файлы (*)"));
+    // Ввод имени без расширения дополняет .txt.
+    dialog.setDefaultSuffix(QStringLiteral("txt"));
+    dialog.setObjectName(QStringLiteral("saveFileDialog"));
+    if (!m_filePath.isEmpty())
+        dialog.selectFile(m_filePath);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return false;
+
+    const QStringList files = dialog.selectedFiles();
+    if (files.isEmpty())
+        return false;
+    return saveFileTo(files.first());
+}
+
+bool MainWindow::writeFile(const QString& path)
+{
+    const TextSaveResult saved =
+        TextFileIO::saveUtf8(path, m_editor->toPlainText());
+    if (!saved.ok) {
+        QMessageBox::warning(
+            this, tr("Ошибка сохранения"),
+            tr("Не удалось сохранить файл «%1»:\n%2")
+                .arg(path, saved.error));
+        return false;
+    }
+
+    m_editor->document()->setModified(false);
+    updateDocumentIndicator();
+    statusBar()->showMessage(tr("Сохранено: %1").arg(path));
+    return true;
+}
+
+void MainWindow::setDocumentText(const QString& text,
+                                 const QString& filePath)
+{
+    // Пауза генерации на время подмены документа: контроллер выключен —
+    // textChanged от setPlainText/clear не запланирует debounce, запрос
+    // «в полёте» отменяется, показанная подсказка снимается («после
+    // открытия очищать актуальную подсказку»). Обратное включение ничего
+    // не запускает — генерация во время загрузки не стартует.
+    if (m_controller != nullptr)
+        m_controller->setEnabled(false);
+
+    m_filePath = filePath;
+    m_editor->setPlainText(text);
+    m_editor->document()->setModified(false);
+
+    if (m_controller != nullptr)
+        m_controller->setEnabled(true);
+
+    updateDocumentIndicator();
+}
+
+void MainWindow::updateDocumentIndicator()
+{
+    const QString name = m_filePath.isEmpty()
+        ? tr("Без имени")
+        : QFileInfo(m_filePath).fileName();
+    const bool modified = m_editor->document()->isModified();
+
+    // Имя + состояние в панели; в заголовке — «имя[*]»: маркер
+    // изменённости рисует setWindowModified (звёздочка/точка закрытия).
+    m_documentIndicator->setText(
+        tr("%1 • %2").arg(name,
+                          modified ? tr("изменён")
+                                   : tr("не изменён")));
+    setWindowTitle(tr("%1[*] — Ptuch Editor").arg(name));
+    setWindowModified(modified);
 }
 
 void MainWindow::setupController()
@@ -187,6 +402,11 @@ void MainWindow::setupController()
     connect(m_editor, &QPlainTextEdit::cursorPositionChanged,
             m_controller, &SuggestionController::onCursorPositionChanged);
 
+    // Имя файла / modified state следят за изменениями документа
+    // (типовые undo/redo тоже проходят через textChanged).
+    connect(m_editor, &QPlainTextEdit::textChanged,
+            this, &MainWindow::updateDocumentIndicator);
+
     // Кнопки -> контроллер
     connect(m_generateButton, &QPushButton::clicked,
             m_controller, &SuggestionController::requestSuggestion);
@@ -209,6 +429,14 @@ void MainWindow::setupController()
     // MainWindow здесь ничего не считает, только соединяет.
     connect(m_stylePanel, &StylePanel::styleMixChanged,
             m_controller, &SuggestionController::setStyleMix);
+
+    // Профили (нейтральные QString/double-поля) — контроллер проверяет
+    // adapterPath активных стилей перед отправкой запроса (явные ошибки
+    // вместо тихого игнора; см. README «Стили и LoRA-адаптеры»). Ни в
+    // профилях, ни в панели нет типов библиотек обучения. Профили в MVP
+    // статичны — отдаём один раз; изменения весов идут через
+    // styleMixChanged выше.
+    m_controller->setStyleProfiles(m_stylePanel->mixer().profiles());
 
     // Контроллер -> индикатор состояния (сам контроллер виджетов не знает)
     connect(m_controller, &SuggestionController::stateChanged,
@@ -387,6 +615,12 @@ void MainWindow::applySettings(const AppSettings& settings)
 
     if (modelAffectingChanged)
         reloadLlamaBackend();
+
+    // 3) Тема: схема применяется сразу — палитра приложения и
+    //    stylesheet'ы окна/панели (для default — возврат к системной
+    //    палитре и снятие stylesheet'ов, см. src/UI/theme.h).
+    if (previous.style != settings.style)
+        applyTheme(Theme::schemeFromId(settings.style));
 }
 
 void MainWindow::reloadLlamaBackend()
@@ -416,73 +650,73 @@ void MainWindow::reloadLlamaBackend()
 
 void MainWindow::updateStateIndicator(SuggestionController::State state)
 {
-    QString title;
-    QString color;
-
-    switch (state) {
-    case SuggestionController::State::Idle:
-        title = QStringLiteral("Ready");
-        color = QStringLiteral("#4caf50");
-        break;
-    case SuggestionController::State::Debouncing:
-        title = QStringLiteral("Waiting");
-        color = QStringLiteral("#ffb300");
-        break;
-    case SuggestionController::State::Generating:
-        title = QStringLiteral("Generating");
-        color = QStringLiteral("#42a5f5");
-        break;
-    case SuggestionController::State::Ready:
-        title = QStringLiteral("Ready");
-        color = QStringLiteral("#4caf50");
-        break;
-    case SuggestionController::State::Error:
-        title = QStringLiteral("Error");
-        color = QStringLiteral("#f44336");
-        break;
-    }
-
-    m_stateIndicator->setText(title);
+    // Заголовок состояния — всегда; цвет — из темы (error красный,
+    // generating электрик-синий и т.д.), инлайновый stylesheet метки,
+    // фон/рамка остаются от QLabel#stateIndicator. Системная схема
+    // цвет не задаёт (invalid) — надпись остаётся системной.
+    m_stateIndicator->setText(Theme::stateTitle(state));
+    const QColor color = Theme::stateColor(m_scheme, state);
     m_stateIndicator->setStyleSheet(
-        QStringLiteral("color: %1; font-weight: bold;").arg(color));
+        color.isValid()
+            ? QStringLiteral("color: %1; font-weight: bold;")
+                  .arg(color.name(QColor::HexRgb))
+            : QString());
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
-    // Клавиши переводятся здесь: контроллер не знает про QKeyEvent/виджеты.
-    if (watched == m_editor &&
-        event->type() == QEvent::KeyPress &&
-        m_controller != nullptr) {
-        auto *keyEvent = static_cast<QKeyEvent *>(event);
-
-        // Tab — принять показанную подсказку (вставка в документ).
-        if (keyEvent->key() == Qt::Key_Tab &&
-            keyEvent->modifiers() == Qt::NoModifier &&
-            m_controller->hasSuggestion()) {
-            const QString accepted = m_controller->suggestion();
-            m_controller->acceptSuggestion();
-            statusBar()->showMessage(
-                tr("Подсказка принята: %1").arg(accepted));
-            return true;
+    if (watched == m_editor && m_controller != nullptr) {
+        // Потеря фокуса редактором (клик по панели/диалог/переключение
+        // окна): подсказка скрывается, debounce и активный запрос
+        // гасятся — контроллер сам, eventFilter только сообщает.
+        if (event->type() == QEvent::FocusOut) {
+            m_controller->onFocusLost();
+            return QMainWindow::eventFilter(watched, event);
         }
 
-        // Shift+Tab — запросить альтернативную подсказку.
-        if (keyEvent->key() == Qt::Key_Tab &&
-            keyEvent->modifiers() == Qt::ShiftModifier &&
-            m_controller->hasSuggestion()) {
-            m_controller->requestAlternative();
-            return true;
-        }
+        // Клавиши переводятся здесь: контроллер не знает про QKeyEvent/виджеты.
+        if (event->type() == QEvent::KeyPress) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
 
-        // Escape — отклонить подсказку, debounce или запрос в полёте.
-        if (keyEvent->key() == Qt::Key_Escape &&
-            (m_controller->hasSuggestion() ||
-             m_controller->state() ==
-                 SuggestionController::State::Debouncing ||
-             m_controller->state() ==
-                 SuggestionController::State::Generating)) {
-            m_controller->rejectSuggestion();
-            return true;
+            // Ctrl+Space — немедленный запрос: минует debounce и
+            // стартует генерацию синхронно (тот же путь, что Generate).
+            if (keyEvent->key() == Qt::Key_Space &&
+                keyEvent->modifiers() == Qt::ControlModifier) {
+                m_controller->requestSuggestion();
+                return true;
+            }
+
+            // Tab — принять показанную подсказку (вставка в документ).
+            // hasSuggestion() — только актуальная: старая подсказка
+            // очищена ещё при вводе/смене курсора/потере фокуса.
+            if (keyEvent->key() == Qt::Key_Tab &&
+                keyEvent->modifiers() == Qt::NoModifier &&
+                m_controller->hasSuggestion()) {
+                const QString accepted = m_controller->suggestion();
+                m_controller->acceptSuggestion();
+                statusBar()->showMessage(
+                    tr("Подсказка принята: %1").arg(accepted));
+                return true;
+            }
+
+            // Shift+Tab — запросить альтернативную подсказку.
+            if (keyEvent->key() == Qt::Key_Tab &&
+                keyEvent->modifiers() == Qt::ShiftModifier &&
+                m_controller->hasSuggestion()) {
+                m_controller->requestAlternative();
+                return true;
+            }
+
+            // Escape — отклонить подсказку, debounce или запрос в полёте.
+            if (keyEvent->key() == Qt::Key_Escape &&
+                (m_controller->hasSuggestion() ||
+                 m_controller->state() ==
+                     SuggestionController::State::Debouncing ||
+                 m_controller->state() ==
+                     SuggestionController::State::Generating)) {
+                m_controller->rejectSuggestion();
+                return true;
+            }
         }
     }
 
@@ -491,6 +725,16 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Несохранённые изменения — ПЕРЕД shutdown:
+    //  Cancel  -> ignore: окно живо, контроллер/потоки НЕ остановлены
+    //            (иначе после отмены подсказки бы отвалились);
+    //  Save    -> запись; сбой/отмена Save As тоже остаёмся в окне;
+    //  Discard -> закрываемся штатно.
+    if (!maybeSave()) {
+        event->ignore();
+        return;
+    }
+
     // Останавливаем debounce, отменяем активный запрос и отвязываем
     // backend до разрушения виджетов: таймер и колбэки больше не
     // сработают (опоздавшие отсекаются QPointer'ом в контроллере).
@@ -506,106 +750,39 @@ void MainWindow::closeEvent(QCloseEvent *event)
 
 void MainWindow::applyStyle()
 {
-    setStyleSheet(R"(
-        QMainWindow {
-            background-color: #3a3a3a;
-        }
+    // Схема темы (default / ПТЮЧ / светлый) — из настроек; применяется
+    // и при старте, и при изменении в applySettings.
+    applyTheme(Theme::schemeFromId(AppSettings::load().style));
+}
 
-        QWidget {
-            color: #f0f0f0;
-            font-size: 13px;
-        }
+void MainWindow::applyTheme(Theme::Scheme scheme)
+{
+    m_scheme = scheme;
 
-        QToolBar#statusPanel {
-            background-color: #3a3a3a;
-            border: none;
-            border-bottom: 1px solid #2a2a2a;
-            spacing: 8px;
-            padding: 4px;
-        }
+    if (scheme == Theme::Scheme::System) {
+        // Системная схема: палитра — к снимку до темизации, все
+        // stylesheet'ы снимаются — цвета шрифтов и контролов
+        // платформенные (включая зону набора).
+        qApp->setPalette(m_systemPalette);
+        setStyleSheet(QString());
+    } else {
+        // Палитра приложения — базовые роли для всех виджетов (в т.ч.
+        // тех, что идут без stylesheet) и для ghost-подсказки (она
+        // красит по Base/Text viewport'а — эти цвета совпадают с фоном
+        // редактора и его текстом).
+        qApp->setPalette(Theme::palette(scheme));
+        // Stylesheet окна: состояния контролов (hover/pressed/
+        // disabled/focus), состояния контроллера на индикаторе, зона
+        // набора без визуального шума.
+        setStyleSheet(Theme::mainStyleSheet(scheme));
+    }
 
-        QLabel#stateIndicator {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 5px 10px;
-        }
+    // Панель стилей живёт со своим stylesheet — та же схема.
+    if (m_stylePanel != nullptr)
+        m_stylePanel->setScheme(scheme);
 
-        QPushButton#generateButton, QPushButton#clearButton {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 6px 12px;
-            color: #ffffff;
-        }
-
-        QPushButton#generateButton:hover,
-        QPushButton#clearButton:hover {
-            background-color: #505050;
-        }
-
-        QPushButton#generateButton:pressed,
-        QPushButton#clearButton:pressed {
-            background-color: #333333;
-        }
-
-        QLineEdit#textInput {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 6px 8px;
-            color: #ffffff;
-            selection-background-color: #6a6a6a;
-        }
-
-        QComboBox#modeCombo {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 4px 8px;
-            color: #ffffff;
-        }
-
-        QComboBox#modeCombo::drop-down {
-            border: none;
-        }
-
-        QComboBox#modeCombo QAbstractItemView {
-            background-color: #454545;
-            color: #ffffff;
-            selection-background-color: #6a6a6a;
-        }
-
-        QLabel {
-            color: #dddddd;
-        }
-
-        QStatusBar {
-            background-color: #2f2f2f;
-            color: #cccccc;
-            border-top: 1px solid #2a2a2a;
-        }
-
-        /* Хост для StylePanel (сама панель стилизует своё содержимое). */
-        QDockWidget#styleDock {
-            background-color: #333333;
-            color: #f0f0f0;
-        }
-
-        QDockWidget#styleDock::title {
-            background-color: #2f2f2f;
-            color: #cccccc;
-            text-align: left;
-            padding: 6px;
-            border-bottom: 1px solid #2a2a2a;
-        }
-
-        QPlainTextEdit#mainEditor {
-            background-color: #333333;
-            color: #ffffff;
-            border: none;
-            padding: 8px;
-            selection-background-color: #6a6a6a;
-        }
-    )");
+    // Индикатор состояния: инлайновый цвет перерисовывается под новую
+    // схему (System снимает его совсем — надпись остаётся).
+    if (m_controller != nullptr && m_stateIndicator != nullptr)
+        updateStateIndicator(m_controller->state());
 }

@@ -14,6 +14,21 @@ struct StyleWeight
     float weight = 0.0f;
 };
 
+// Описание адаптера в запросе — нейтральный контракт на Qt-типах
+// (QString/double), без привязки к библиотеке обучения. Пустой path =
+// адаптер не запрошен (текущий MVP — всегда пусто; см. README,
+// раздел «Стили и LoRA-адаптеры»).
+struct AdapterSpec
+{
+    QString path;        // файл адаптера; пусто = нет адаптера
+    QString type;        // свободный тег формата: "lora", "dora", ...
+    QString baseModelId; // базовая модель, под которую обучен адаптер
+    QString promptTag;   // триггер-метка (для adapter-capable backend'ов)
+    double scale = 1.0;  // сила применения; интерпретация — за backend'ом
+
+    bool isEmpty() const { return path.isEmpty(); }
+};
+
 // Запрос на асинхронную генерацию текста.
 struct GenerationRequest
 {
@@ -27,6 +42,11 @@ struct GenerationRequest
     double temperature = 0.7;
     double topP = 0.9;
     QVector<StyleWeight> styleWeights;
+    // Опциональный адаптер (пусто в MVP). Backend без поддержки
+    // (supportsAdapters() == false) ОБЯЗАН ответить generationError с
+    // явным объяснением — не игнорировать молча (см. mock/llama
+    // generate()).
+    AdapterSpec adapter;
 };
 
 struct GenerationResult
@@ -93,7 +113,18 @@ public:
     ~ITextGenerationBackend() override = default;
 
     // Асинхронно: возвращает управление сразу, не блокирует вызывающего.
+    // Контракт адаптеров: при непустом request.adapter и
+    // supportsAdapters() == false реализация обязана вернуть
+    // generationError с явным текстом «не поддерживает адаптеры», а не
+    // тихо игнорировать (никакой фиктивной загрузки LoRA).
     virtual void generate(const GenerationRequest& request) = 0;
+
+    // Поддержка внешних адаптеров (LoRA/…). false по умолчанию: mock и
+    // текущий GGUF-backend работают без адаптеров — смешивание стилей
+    // идёт только через prompt. Настоящее взвешенное наложение LoRA
+    // требует отдельного inference backend'а, который переопределит
+    // этот метод (и сам загрузит adapterPath).
+    virtual bool supportsAdapters() const { return false; }
 
     // Просьба прекратить генерацию requestId (может быть проигнорирована
     // — см. договорённость про сверку requestId выше).

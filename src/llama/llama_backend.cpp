@@ -234,6 +234,20 @@ void LlamaBackend::requestStop()
 
 void LlamaBackend::generate(const GenerationRequest& request)
 {
+    // Адаптеры (LoRA) не реализованы: явный отказ вместо тихого игнора —
+    // никакой фиктивной загрузки. Проверка ДО каких-либо изменений
+    // состояния (отклонённый запрос не трогает активный id/флаги) и без
+    // llama-вызовов. См. README «Стили и LoRA-адаптеры».
+    if (!request.adapter.isEmpty()) {
+        const QString message =
+            tr("Бэкенд llama.cpp не поддерживает адаптеры "
+               "(adapterPath=%1) — стиль применяется через prompt")
+                .arg(request.adapter.path);
+        setDiagnosticError(message);
+        emit generationError(request.requestId, message);
+        return;
+    }
+
     // Последний запрошенный id выигрывает: уже поставленные в очередь
     // устаревшие запросы при старте увидят несовпадение id и завершатся
     // без генерации (потребитель всё равно сверяет requestId).

@@ -11,11 +11,22 @@ class QPlainTextEdit;
 // он только рисует; содержимое приходит извне (MainWindow связывает
 // сигналы suggestionReady / suggestionCleared контроллера).
 //
+// Фон: под каждой строкой подсказки — непрозрачный прямоугольник цвета
+// QPalette::Base viewport'а (тот же, что под текстом документа). Без
+// него ghost наезжал на продолжение строки после курсора и обе строки
+// становились нечитаемыми; хвост документа ПОСЛЕ подсказки остаётся
+// виден.
+//
 // Координаты: overlay — ребёнок editor->viewport() с геометрией во весь
 // viewport, поэтому paintEvent работает в координатах viewport'а.
 // Измерение (см. также test): QPlainTextEdit::cursorRect() возвращает
 // прямоугольник именно в координатах viewport'а — даже когда stylesheet
 // сдвигает viewport внутрь виджета (padding: 8px), cursorRect не меняется.
+//
+// Скролл: QPlainTextEdit прокручивает через QWidget::scroll(), а тот
+// сдвигает дочерних (QWidgetPrivate::scrollChildren) — геометрия
+// overlay уезжает из-под курсора. moveEvent возвращает overlay на весь
+// viewport (см. реализацию).
 //
 // Перенос: подсказка никогда не уезжает за правый край экрана — текст
 // ломается на строки (первая — от курсора до правого края, продолжение
@@ -46,6 +57,9 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     // Следим за resize'ом viewport'а, чтобы overlay покрывал его целиком.
     bool eventFilter(QObject* watched, QEvent* event) override;
+    // Скролл viewport'а сдвигает дочерних (scrollChildren) — восстанавливаем
+    // геометрию «во весь viewport» сразу после сдвига.
+    void moveEvent(QMoveEvent* event) override;
 
 private:
     QPlainTextEdit* m_editor = nullptr; // не владеет

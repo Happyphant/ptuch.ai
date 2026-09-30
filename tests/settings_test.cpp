@@ -2,17 +2,26 @@
 #include <QtTest>
 
 #include "UI/settings_dialog.h"
+#include "UI/theme.h"
 #include "llama/llama_backend.h"
 #include "settings/app_settings.h"
 
+#include "qsettings_backup.h"
+
+#include <QAbstractItemView>
+#include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QDir>
 #include <QFile>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QSpinBox>
+#include <QStyle>
+#include <QStyleOption>
 #include <QTemporaryDir>
 
 #if PTUCH_DIAGNOSTICS
@@ -31,7 +40,8 @@ namespace {
 bool isOurSettingsKey(const QString& key)
 {
     return key.startsWith(QLatin1String("llama/")) ||
-           key.startsWith(QLatin1String("suggestion/"));
+           key.startsWith(QLatin1String("suggestion/")) ||
+           key.startsWith(QLatin1String("ui/"));
 }
 
 } // namespace
@@ -68,6 +78,11 @@ private slots:
     void diagnosticsReportFormatsSnapshot();
     void diagnosticsDialogShowsAndCopiesReport();
 
+    // Визуальная диагностика стилей (гейт PTUCH_DEBUG_STYLE=default|
+    // ptuch|light): печатает геометрию полей и выпадающего списка
+    // комбобокса и держит диалог открытым для скриншота.
+    void debugStyleVisual();
+
 private:
     static QSettings makeSettings()
     {
@@ -84,6 +99,11 @@ void SettingsTest::init()
     qunsetenv("PTUCH_MODEL_PATH");
     qunsetenv("PTUCH_MODEL_DIR");
 
+    // Самовосстановление после АВАРИЙНОГО прогона: SIGABRT до cleanup
+    // теряет памятный снимок — ключи вернутся из файла-снимка
+    // (см. qsettings_backup.h), ДО нового снимка.
+    QSettingsBackup::restoreIfCrashed(isOurSettingsKey);
+
     // Снимок наших ключей + дефолтное состояние теста (чужие ключи
     // файла — в т.ч. fallback NSGlobalDomain — не трогаем).
     QSettings settings = makeSettings();
@@ -95,6 +115,9 @@ void SettingsTest::init()
         settings.remove(key);
     }
     settings.sync();
+
+    // Дубль снимка в файл — страховка от аварийного завершения слота.
+    QSettingsBackup::save(m_original);
 }
 
 void SettingsTest::cleanup()
@@ -111,6 +134,8 @@ void SettingsTest::cleanup()
         settings.setValue(it.key(), it.value());
     settings.sync();
     m_original.clear();
+    // Возврат выполнен штатно — файл-снимок больше не нужен.
+    QSettingsBackup::clear();
 }
 
 void SettingsTest::defaultsAreUsedWithoutStoredValues()
@@ -127,6 +152,9 @@ void SettingsTest::defaultsAreUsedWithoutStoredValues()
     QCOMPARE(value.gpuLayers, -1);
     QCOMPARE(value.debounceMs, 500);
     QVERIFY(value.autoSuggestions);
+    // Стиль по умолчанию — тёмная тема ПТЮЧ (подпись приложения);
+    // системная и светлая — осознанный выбор пользователя.
+    QCOMPARE(value.style, QLatin1String(AppSettings::stylePtuch));
 
     // Дефолты обязаны лежать внутри допустимых диапазонов —
     // иначе sanitize() поломала бы их же.
@@ -148,6 +176,7 @@ void SettingsTest::savedValuesRoundtripAcrossLaunches()
     value.gpuLayers = 12;
     value.debounceMs = 250;
     value.autoSuggestions = false;
+    value.style = QLatin1String(AppSettings::styleLight);
     value.save();
 
     // «Новый запуск» = новое чтение из QSettings.
@@ -159,6 +188,7 @@ void SettingsTest::savedValuesRoundtripAcrossLaunches()
     QCOMPARE(loaded.gpuLayers, value.gpuLayers);
     QCOMPARE(loaded.debounceMs, value.debounceMs);
     QCOMPARE(loaded.autoSuggestions, value.autoSuggestions);
+    QCOMPARE(loaded.style, value.style);
 
     // Ключ llama/modelPath общий с resolveModelPath(): сохранённый путь
     // приложение находит при поиске модели (файл создаём реально).
@@ -188,6 +218,7 @@ void SettingsTest::outOfRangeStoredValuesAreSanitized()
     settings.setValue(AppSettings::keyTopP, 42.0);
     settings.setValue(AppSettings::keyGpuLayers, 777);
     settings.setValue(AppSettings::keyDebounceMs, -1);
+    settings.setValue(AppSettings::keyStyle, QStringLiteral("∞"));
     settings.sync();
 
     // load() обязан вернуть валидные значения: именно они уходят в
@@ -200,6 +231,8 @@ void SettingsTest::outOfRangeStoredValuesAreSanitized()
     QCOMPARE(value.topP, AppSettings::topPMax);
     QCOMPARE(value.gpuLayers, AppSettings::gpuLayersMax);
     QCOMPARE(value.debounceMs, AppSettings::debounceMin);
+    // Мусорный id схемы -> дефолт ПТЮЧ (те же id, что в Theme).
+    QCOMPARE(value.style, QLatin1String(AppSettings::stylePtuch));
 }
 
 void SettingsTest::dialogShowsStoredSettings()
@@ -213,6 +246,7 @@ void SettingsTest::dialogShowsStoredSettings()
     stored.gpuLayers = 24;
     stored.debounceMs = 750;
     stored.autoSuggestions = false;
+    stored.style = QLatin1String(AppSettings::styleLight);
     stored.save();
 
     SettingsDialog dialog;
@@ -233,6 +267,8 @@ void SettingsTest::dialogShowsStoredSettings()
         QStringLiteral("debounceEdit"));
     auto* autoCheck = dialog.findChild<QCheckBox*>(
         QStringLiteral("autoSuggestionsCheck"));
+    auto* styleCombo = dialog.findChild<QComboBox*>(
+        QStringLiteral("styleCombo"));
     auto* testButton = dialog.findChild<QPushButton*>(
         QStringLiteral("testModelButton"));
     auto* statusLabel = dialog.findChild<QLabel*>(
@@ -240,7 +276,7 @@ void SettingsTest::dialogShowsStoredSettings()
 
     QVERIFY(path && context && maxTokens && temperature && topP);
     QVERIFY(gpuLayers && debounce && autoCheck);
-    QVERIFY(testButton && statusLabel);
+    QVERIFY(styleCombo && testButton && statusLabel);
 
     QCOMPARE(path->text(), stored.modelPath);
     QCOMPARE(context->value(), stored.contextSize);
@@ -250,6 +286,11 @@ void SettingsTest::dialogShowsStoredSettings()
     QCOMPARE(gpuLayers->value(), stored.gpuLayers);
     QCOMPARE(debounce->value(), stored.debounceMs);
     QCOMPARE(autoCheck->isChecked(), stored.autoSuggestions);
+    // Комбобокс стиля: ровно три схемы, выбрана сохранённая
+    // (default / ПТЮЧ / светлый, id в userData).
+    QCOMPARE(styleCombo->count(), 3);
+    QCOMPARE(styleCombo->currentData().toString(), stored.style);
+    QCOMPARE(styleCombo->currentText(), QStringLiteral("светлый"));
 }
 
 void SettingsTest::dialogWidgetsEnforceRanges()
@@ -324,6 +365,24 @@ void SettingsTest::dialogReturnsValuesInRange()
             value.gpuLayers <= AppSettings::gpuLayersMax);
     QVERIFY(value.debounceMs >= AppSettings::debounceMin &&
             value.debounceMs <= AppSettings::debounceMax);
+
+    // Комбобокс стиля входит в settings(): переключение доезжает до
+    // AppSettings (и до applySettings) — id схемы, а не заголовок.
+    auto* styleCombo = dialog.findChild<QComboBox*>(
+        QStringLiteral("styleCombo"));
+    QVERIFY(styleCombo);
+    QVERIFY(styleCombo->count() == 3);
+    styleCombo->setCurrentIndex(
+        (styleCombo->currentIndex() + 1) % styleCombo->count());
+    QCOMPARE(dialog.settings().style,
+             styleCombo->currentData().toString());
+    // Пункты — ровно те id, что читает AppSettings/Theme.
+    const QStringList ids = {styleCombo->itemData(0).toString(),
+                             styleCombo->itemData(1).toString(),
+                             styleCombo->itemData(2).toString()};
+    QVERIFY(ids.contains(QLatin1String(AppSettings::styleSystem)));
+    QVERIFY(ids.contains(QLatin1String(AppSettings::stylePtuch)));
+    QVERIFY(ids.contains(QLatin1String(AppSettings::styleLight)));
 }
 
 void SettingsTest::testModelReportsMissingFileWithoutBlocking()
@@ -527,6 +586,87 @@ void SettingsTest::diagnosticsDialogShowsAndCopiesReport()
 #else
     QSKIP("Режим диагностики выключен (PTUCH_DIAGNOSTICS=OFF)");
 #endif
+}
+
+void SettingsTest::debugStyleVisual()
+{
+    const QString styleId = qEnvironmentVariable("PTUCH_DEBUG_STYLE");
+    if (styleId.isEmpty())
+        QSKIP("Визуальная диагностика включается PTUCH_DEBUG_STYLE=...");
+
+    QSettings settings = makeSettings();
+    settings.setValue(AppSettings::keyStyle, styleId);
+    settings.sync();
+
+    // Как в MainWindow::applyTheme: палитра приложения + stylesheet
+    // (для System ничего — платформенный вид контролов).
+    const Theme::Scheme scheme = Theme::schemeFromId(styleId);
+    if (scheme == Theme::Scheme::System) {
+        qApp->setStyleSheet(QString());
+    } else {
+        qApp->setPalette(Theme::palette(scheme));
+        qApp->setStyleSheet(Theme::mainStyleSheet(scheme));
+    }
+
+    SettingsDialog dialog;
+    dialog.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&dialog));
+
+    auto* path = dialog.findChild<QLineEdit*>(
+        QStringLiteral("modelPathEdit"));
+    auto* combo = dialog.findChild<QComboBox*>(
+        QStringLiteral("styleCombo"));
+    QVERIFY(path && combo);
+
+    QStyleOptionComboBox opt;
+    opt.initFrom(combo);
+    opt.rect = combo->rect();
+    opt.editable = combo->isEditable();
+    opt.frame = true;
+    opt.subControls = QStyle::SC_All;
+    const QRect listPopup = combo->style()->subControlRect(
+        QStyle::CC_ComboBox, &opt, QStyle::SC_ComboBoxListBoxPopup, combo);
+    const QRect listPopup2 = combo->style()->subControlRect(
+        QStyle::CC_ComboBox, &opt, QStyle::SC_ComboBoxEditField, combo);
+    const QPoint comboGlobal = combo->mapToGlobal(QPoint(0, 0));
+    const QPoint comboBottom = combo->mapToGlobal(QPoint(0, combo->height()));
+
+    qInfo().noquote()
+        << "style=" << styleId
+        << "dialog=" << QRect(dialog.pos(), dialog.size())
+        << "pathEditW=" << path->width()
+        << "comboW=" << combo->width()
+        << "comboGlobal=" << comboGlobal
+        << "comboBottom=" << comboBottom
+        << "listRectLocal=" << listPopup
+        << "SH_Popup="
+        << combo->style()->styleHint(QStyle::SH_ComboBox_Popup, &opt,
+                                     combo)
+        << "PopupFrameStyle="
+        << combo->style()->styleHint(QStyle::SH_ComboBox_PopupFrameStyle,
+                                     &opt, combo)
+        << "PM_MenuVMargin="
+        << combo->style()->pixelMetric(QStyle::PM_MenuVMargin, &opt, combo);
+
+    // Закрытый вид диалога (стрелка комбобокса) — снимок окна.
+    const QString dir = QDir::tempPath() + QStringLiteral("/ptuch_dbg");
+    QDir().mkpath(dir);
+    dialog.grab().save(dir + QStringLiteral("/%1_dialog.png").arg(styleId));
+    QTest::qWait(2500);
+
+    combo->showPopup();
+    QTest::qWait(100);
+    QWidget* popup = combo->view()->window();
+    qInfo().noquote() << "popupGeometry=" << popup->geometry()
+                      << "popupVisible=" << popup->isVisible();
+    popup->grab().save(
+        dir + QStringLiteral("/%1_popup.png").arg(styleId));
+    dialog.grab().save(
+        dir + QStringLiteral("/%1_dialog_with_popup.png").arg(styleId));
+
+    // Открытый выпадающий список — скриншот.
+    QTest::qWait(6000);
+    combo->hidePopup();
 }
 
 QTEST_MAIN(SettingsTest)

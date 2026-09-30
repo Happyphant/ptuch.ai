@@ -95,6 +95,9 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
     ${PTUCH_DIAGNOSTIC_SOURCES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
@@ -113,6 +116,11 @@ qt_add_executable(PtuchEditor
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.h"
+    # Документ v1: UTF-8 plain text (чтение/атомарная запись через QSaveFile).
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.h"
 )
 
 set_target_properties(PtuchEditor PROPERTIES
@@ -145,6 +153,18 @@ target_link_libraries(PtuchEditor PRIVATE
     Qt6::Widgets
     llama
 )
+
+# macOS: ad-hoc-подпись бандла после каждой сборки. Linker-подпись
+# внутреннего Mach-O не создаёт печать бандла (_CodeSignature), а
+# MTLCompilerService при попытке загрузки модели молча не отвечает
+# XPC-клиенту с невалидной подписью бандла — llama-поток зависает
+# навсегда в ggml_metal_library_init (см. PERFORMANCE_REVIEW.md).
+if(APPLE)
+    add_custom_command(TARGET PtuchEditor POST_BUILD
+        COMMAND codesign --force --sign - "$<TARGET_BUNDLE_DIR:PtuchEditor>"
+        COMMENT "Ad-hoc codesign PtuchEditor.app"
+        VERBATIM)
+endif()
 
 # ---------------------------------------------------------------------------
 # Unit-тесты (Qt Test входит в Qt 6 — внешних зависимостей не добавляется)
@@ -183,6 +203,9 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.h"
+        # Профили стилей: проверка adapterPath/совместимости адаптеров.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
         # Мета-объект интерфейса backend'а (сигналы ready/error).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
     )
@@ -242,6 +265,9 @@ if(PTUCH_BUILD_TESTS)
         # MainWindow создаёт StylePanel (правый dock со стилями).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
         # Модель StylePanel — доменный микшер без виджетов.
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
@@ -263,6 +289,9 @@ if(PTUCH_BUILD_TESTS)
         # PTUCH_DISABLE_LLAMA (см. GhostSuggestionTest::initTestCase).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"
+        # Документ v1: openFile/saveFileTo пишут через TextFileIO.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.h"
     )
 
     target_include_directories(GhostSuggestionTests
@@ -319,6 +348,10 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        # Тема (Theme) — stylesheet диалога и цвета Test Model.
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
         # Тесты снимка диагностики — только при включённом режиме
         # PTUCH_DIAGNOSTICS (при выключенной опции слоты QSKIP).
         ${PTUCH_DIAGNOSTIC_SOURCES}
@@ -385,6 +418,9 @@ if(PTUCH_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/style_panel_test.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
@@ -407,4 +443,211 @@ if(PTUCH_BUILD_TESTS)
     )
 
     add_test(NAME StylePanel COMMAND StylePanelTests)
+
+    # Тесты PromptBuilder: system/user промпт автодополнения по
+    # контракту (только продолжение, без пояснений/кавычек/метакомментариев),
+    # контекст ровно один раз и без декораций, сохранение языка
+    # документа (ru/en шаблоны + автоопределение), смешанные стили с
+    # нормализованными весами, детерминизм структуры, санитизация
+    # параметров генерации диапазонами AppSettings.
+    # Без Qt6::Widgets и без QSettings: QTEST_GUILESS_MAIN + настройки
+    # приходят значениями (только константы диапазонов AppSettings).
+    add_executable(PromptBuilderTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/prompt_builder_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+        # StyleWeight (style_mixer) + диапазоны параметров (prompt_builder).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+    )
+
+    target_include_directories(PromptBuilderTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(PromptBuilderTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(PromptBuilderTests)
+
+    target_link_libraries(PromptBuilderTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+    )
+
+    add_test(NAME PromptBuilder COMMAND PromptBuilderTests)
+
+    # Тесты файлового слоя документа v1 (UTF-8 plain text):
+    # round-trip русского текста байт-в-байт (UTF-8 без BOM), атомарная
+    # перезапись QSaveFile, ошибки чтения (нет файла/каталог) и записи
+    # (нет каталога), отбрасывание ведущего BOM. Без виджетов:
+    # QTEST_GUILESS_MAIN + только Qt6::Core.
+    add_executable(TextFileIOTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/text_file_io_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.h"
+    )
+
+    target_include_directories(TextFileIOTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(TextFileIOTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(TextFileIOTests)
+
+    target_link_libraries(TextFileIOTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+    )
+
+    add_test(NAME TextFileIO COMMAND TextFileIOTests)
+
+    # Тестовый план (TEST_PLAN.md): сквозные сценарии, которым нужен
+    # живой MainWindow, но НЕ фокус окна и НЕ реальная модель/GPU:
+    #  - ошибка загрузки модели: битый GGUF из PTUCH_MODEL_PATH ->
+    #    статус с причиной + fallback на mock + работающие подсказки;
+    #  - закрытие приложения посреди активной генерации -> shutdown
+    #    (cancel + отвязка backend) + остановка потоков, поздний ответ
+    #    отброшен.
+    # Состав источников совпадает с GhostSuggestionTests (MainWindow
+    # тянет весь UI-контур); llama грузит только заведомо битый файл.
+    add_executable(TestPlanTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_plan_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+        ${PTUCH_DIAGNOSTIC_SOURCES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mock_text_generation_backend.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mock_text_generation_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.h"
+    )
+
+    target_include_directories(TestPlanTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(TestPlanTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(TestPlanTests)
+
+    target_link_libraries(TestPlanTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        llama
+    )
+
+    add_test(NAME TestPlan COMMAND TestPlanTests)
+
+    # Замеры производительности (PERFORMANCE_REVIEW.md): debounce,
+    # сборка prompt'a, сборка запроса, отображение ghost, блокировки
+    # UI, отмена, накопление памяти/объектов. Always-on слоты идут в
+    # ctest без модели/фокуса; слот реальной модели закрыт гейтом
+    # PTUCH_MODEL_TESTS=1 (запуск из каталога проекта: models/ рядом).
+    add_executable(PerformanceTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/performance_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/MainWindow.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/suggestion_overlay.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/settings_dialog.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/style_panel.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_profile.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/style_mixer.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/prompt_builder.h"
+        ${PTUCH_DIAGNOSTIC_SOURCES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/settings/app_settings.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/suggestion_controller.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/document_state.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/suggestion/editor_adapter.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/text_generation_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mock_text_generation_backend.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/mock_text_generation_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/llama/llama_backend.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/document/text_file_io.h"
+    )
+
+    target_include_directories(PerformanceTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(PerformanceTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(PerformanceTests)
+
+    target_link_libraries(PerformanceTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Widgets
+        llama
+    )
+
+    add_test(NAME Performance COMMAND PerformanceTests)
+
+    # Тесты темы (src/UI/theme.*): палитра (тёмный фон/светлый текст,
+    # accent/secondary, disabled), stylesheet с состояниями
+    # hover/pressed/disabled/focus, цвета состояний error/generating,
+    # контрастность по WCAG, плоский режим без скруглений/градиентов.
+    # Без виджетов: QTEST_GUILESS_MAIN + только Qt6::Core/Gui (цвета
+    # и QPalette — из QtGui).
+    add_executable(ThemeTests
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/theme_test.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/UI/theme.qrc"
+        # suggestion_controller.h подключается темой только ради
+        # перечисления SuggestionController::State — заголовок НЕ в
+        # списках источников (без moc: контроллер в цель не входит).
+    )
+
+    target_include_directories(ThemeTests
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    target_compile_features(ThemeTests PRIVATE cxx_std_20)
+    ptuch_enable_warnings(ThemeTests)
+
+    target_link_libraries(ThemeTests PRIVATE
+        Qt6::Test
+        Qt6::Core
+        Qt6::Gui
+    )
+
+    add_test(NAME Theme COMMAND ThemeTests)
 endif()

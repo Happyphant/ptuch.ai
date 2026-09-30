@@ -2,8 +2,10 @@
 #include "settings_dialog.h"
 
 #include "llama/llama_backend.h"
+#include "theme.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
@@ -25,40 +27,13 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     setWindowTitle(tr("Настройки"));
     setModal(true);
 
-    // Тёмная тема приложения распространяется на диалог (наследование
-    // от MainWindow); фон задаём явно — QDialog без этого остаётся на
-    // системном (возможно, светлом) фоне.
-    setStyleSheet(QStringLiteral(R"(
-        QDialog#settingsDialog { background-color: #3a3a3a; }
-        QDialog#settingsDialog QLabel { color: #dddddd; }
-        QDialog#settingsDialog QLineEdit,
-        QDialog#settingsDialog QSpinBox,
-        QDialog#settingsDialog QDoubleSpinBox {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 4px 6px;
-            color: #ffffff;
-            selection-background-color: #6a6a6a;
-        }
-        QDialog#settingsDialog QPushButton {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 6px 12px;
-            color: #ffffff;
-        }
-        QDialog#settingsDialog QPushButton:hover {
-            background-color: #505050;
-        }
-        QDialog#settingsDialog QPushButton:disabled {
-            background-color: #3d3d3d;
-            color: #999999;
-        }
-        QDialog#settingsDialog QCheckBox { color: #dddddd; }
-    )"));
-
+    // Тема приложения распространяется на диалог (наследование
+    // от MainWindow); собственный stylesheet задаёт фон и состояния
+    // контролов (hover/pressed/disabled/focus) — по схеме из настроек
+    // (default — пустой stylesheet, системный вид контролов).
     const AppSettings values = AppSettings::load();
+    m_scheme = Theme::schemeFromId(values.style);
+    setStyleSheet(Theme::dialogStyleSheet(m_scheme));
 
     auto* mainLayout = new QVBoxLayout(this);
     auto* form = new QFormLayout;
@@ -71,6 +46,9 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_modelPathEdit->setText(values.modelPath);
     m_modelPathEdit->setPlaceholderText(
         tr("не задан — авто-поиск (models/, переменные окружения)"));
+    // Ширина полей одинакова для всех схем: без stylesheet'ов
+    // (default) sizeHint поля слишком узок для чтения пути/значений.
+    m_modelPathEdit->setMinimumWidth(340);
 
     m_browseButton = new QPushButton(QStringLiteral("…"), this);
     m_browseButton->setObjectName(QStringLiteral("browseModelButton"));
@@ -91,6 +69,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
                                 AppSettings::contextSizeMax);
     m_contextSizeEdit->setSingleStep(256);
     m_contextSizeEdit->setValue(values.contextSize);
+    m_contextSizeEdit->setMinimumWidth(110);
     form->addRow(tr("Размер контекста:"), m_contextSizeEdit);
 
     // --- Максимум новых токенов.
@@ -100,6 +79,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
                               AppSettings::maxTokensMax);
     m_maxTokensEdit->setSingleStep(8);
     m_maxTokensEdit->setValue(values.maxTokens);
+    m_maxTokensEdit->setMinimumWidth(110);
     form->addRow(tr("Макс. новых токенов:"), m_maxTokensEdit);
 
     // --- Temperature.
@@ -110,6 +90,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_temperatureEdit->setDecimals(2);
     m_temperatureEdit->setSingleStep(0.05);
     m_temperatureEdit->setValue(values.temperature);
+    m_temperatureEdit->setMinimumWidth(110);
     form->addRow(tr("Temperature:"), m_temperatureEdit);
 
     // --- Top-p.
@@ -119,6 +100,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_topPEdit->setDecimals(2);
     m_topPEdit->setSingleStep(0.05);
     m_topPEdit->setValue(values.topP);
+    m_topPEdit->setMinimumWidth(110);
     form->addRow(tr("Top-p:"), m_topPEdit);
 
     // --- GPU-слои: -1 (минимум) показывается как «все слои».
@@ -130,6 +112,8 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_gpuLayersEdit->setToolTip(
         tr("-1 — все слои на GPU (Metal/CUDA); 0 — только CPU"));
     m_gpuLayersEdit->setValue(values.gpuLayers);
+    // «Все слои (авто)» не помещается в sizeHint спинбокса.
+    m_gpuLayersEdit->setMinimumWidth(160);
     form->addRow(tr("GPU-слои:"), m_gpuLayersEdit);
 
     // --- Интервал debounce.
@@ -140,6 +124,7 @@ SettingsDialog::SettingsDialog(QWidget* parent)
     m_debounceEdit->setSingleStep(50);
     m_debounceEdit->setSuffix(QStringLiteral(" мс"));
     m_debounceEdit->setValue(values.debounceMs);
+    m_debounceEdit->setMinimumWidth(110);
     form->addRow(tr("Пауза перед подсказкой:"), m_debounceEdit);
 
     // --- Автоматические подсказки.
@@ -149,6 +134,27 @@ SettingsDialog::SettingsDialog(QWidget* parent)
         QStringLiteral("autoSuggestionsCheck"));
     m_autoSuggestionsCheck->setChecked(values.autoSuggestions);
     form->addRow(QString(), m_autoSuggestionsCheck);
+
+    // --- Стиль оформления (схема темы): default — системные цвета
+    // шрифтов и контролов, ПТЮЧ — тёмная, светлый — светлая.
+    // Применяется сразу в MainWindow::applySettings.
+    m_styleCombo = new QComboBox(this);
+    m_styleCombo->setObjectName(QStringLiteral("styleCombo"));
+    for (const Theme::Scheme scheme : {Theme::Scheme::System,
+                                       Theme::Scheme::Ptuch,
+                                       Theme::Scheme::Light}) {
+        m_styleCombo->addItem(Theme::schemeTitle(scheme),
+                              Theme::schemeId(scheme));
+    }
+    m_styleCombo->setToolTip(
+        tr("default — системные цвета шрифтов и контролов; "
+           "ПТЮЧ — тёмная тема; светлый — светлая тема"));
+    // Текущая схема из настроек (id санирован load()); стартовое
+    // значение — до connect, сигналов не даём.
+    const int schemeIndex = m_styleCombo->findData(values.style);
+    m_styleCombo->setCurrentIndex(schemeIndex >= 0 ? schemeIndex : 0);
+    m_styleCombo->setMinimumWidth(140);
+    form->addRow(tr("Стиль:"), m_styleCombo);
 
     // --- Тест модели + метка результата (ошибка загрузки видна здесь).
     m_testButton = new QPushButton(tr("Test Model"), this);
@@ -196,6 +202,7 @@ AppSettings SettingsDialog::settings() const
     value.gpuLayers = m_gpuLayersEdit->value();
     value.debounceMs = m_debounceEdit->value();
     value.autoSuggestions = m_autoSuggestionsCheck->isChecked();
+    value.style = m_styleCombo->currentData().toString();
     // Диапазоны виджетов уже гарантированы; повторная санитизация —
     // защита в глубину перед QSettings и LlamaBackend.
     value.sanitize();
@@ -337,13 +344,23 @@ void SettingsDialog::stopTestBackend()
 void SettingsDialog::showTestResult(const QString& text,
                                     TestStatus status)
 {
-    QString color(QStringLiteral("#cccccc"));
+    // Цвет статуса — из цветов схемы (та же красная ошибка, что на
+    // индикаторе состояния; нейтральный — вторичный текст темы).
+    // Системная схема цветов не даёт (invalid) — метка остаётся
+    // со системным шрифтом, различие — в тексте статуса.
+    const Theme::Colors colors = Theme::colors(m_scheme);
+    QColor color;
     if (status == TestStatus::Success)
-        color = QStringLiteral("#4caf50");
+        color = colors.success;
     else if (status == TestStatus::Error)
-        color = QStringLiteral("#f44336");
+        color = colors.error;
+    else
+        color = colors.dimTextColor;
 
     m_testStatusLabel->setText(text);
     m_testStatusLabel->setStyleSheet(
-        QStringLiteral("color: %1; font-weight: bold;").arg(color));
+        color.isValid()
+            ? QStringLiteral("color: %1; font-weight: bold;")
+                  .arg(color.name(QColor::HexRgb))
+            : QString());
 }

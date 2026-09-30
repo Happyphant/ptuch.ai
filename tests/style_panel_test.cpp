@@ -2,6 +2,7 @@
 #include <QtTest>
 
 #include "UI/style_panel.h"
+#include "UI/theme.h"
 #include "suggestion/style_mixer.h"
 
 #include <QCheckBox>
@@ -319,22 +320,51 @@ void StylePanelTest::resetMixZeroesWeightsWithSingleSignal()
     QCOMPARE(m_capture.count, 3);
 }
 
-// Панель приносит собственный тёмный stylesheet (фон, текст, акценты).
+// Панель приносит stylesheet из единого модуля темы (фон, текст,
+// акценты) и переключается по схемам: стартовая — ПТЮЧ (дефолт
+// ui/style), default — системный вид, светлая — светлая тема.
 void StylePanelTest::panelIsDarkThemeReady()
 {
     StylePanel panel;
 
+    // Стартовая схема — ПТЮЧ: цвета берутся из Theme (единый
+    // источник), а не из своей палитры.
+    const Theme::Colors dark = Theme::colors(Theme::Scheme::Ptuch);
     const QString sheet = panel.styleSheet();
     QVERIFY2(!sheet.isEmpty(),
              "Панель без stylesheet не готова к тёмной теме");
-    QVERIFY(sheet.contains(
-        QStringLiteral("#3a3a3a"))); // тёмный фон панели
-    QVERIFY(sheet.contains(
-        QStringLiteral("#dddddd"))); // светлый текст подписей
-    QVERIFY(sheet.contains(
-        QStringLiteral("#42a5f5"))); // акцент слайдера и чекбокса
+    QVERIFY(sheet.contains(dark.panel.name()));     // фон панели
+    QVERIFY(sheet.contains(dark.labelColor.name())); // подписи
+    QVERIFY(sheet.contains(dark.secondary.name())); // акцент
+    QVERIFY(sheet.contains(dark.accentInk.name())); // сумма весов
     QVERIFY(sheet.contains(QStringLiteral("QSlider::groove")));
     QVERIFY(sheet.contains(QStringLiteral("QCheckBox::indicator")));
+
+    auto* marker = panel.findChild<QLabel*>(
+        QStringLiteral("colorMarker_pushkin"));
+    QVERIFY(marker);
+    QVERIFY(marker->styleSheet().contains(
+        QStringLiteral("border-radius")));
+
+    // Системная схема (default): stylesheet панели снят — контролы
+    // системные; цвет маркера-профиля остаётся (это данные), декора
+    // (радиуса) нет.
+    panel.setScheme(Theme::Scheme::System);
+    QVERIFY(panel.styleSheet().isEmpty());
+    QVERIFY(!marker->styleSheet().contains(
+        QStringLiteral("border-radius")));
+    QVERIFY(marker->styleSheet().contains(
+        QStringLiteral("background-color")));
+
+    // Светлая: stylesheet возвращается целиком — светлые цвета схемы.
+    panel.setScheme(Theme::Scheme::Light);
+    const Theme::Colors light = Theme::colors(Theme::Scheme::Light);
+    const QString lightSheet = panel.styleSheet();
+    QVERIFY(!lightSheet.isEmpty());
+    QVERIFY(lightSheet.contains(light.panel.name()));
+    QVERIFY(lightSheet.contains(light.textColor.name()));
+    QVERIFY(lightSheet.contains(QStringLiteral("border-radius")));
+    QVERIFY(marker->styleSheet().contains(QStringLiteral("border-radius")));
 }
 
 QTEST_MAIN(StylePanelTest)

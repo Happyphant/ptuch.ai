@@ -1,6 +1,9 @@
 // diagnostics_dialog.cpp
 #include "diagnostics_dialog.h"
 
+#include "settings/app_settings.h"
+#include "theme.h"
+
 #include <QClipboard>
 #include <QFormLayout>
 #include <QGuiApplication>
@@ -82,23 +85,13 @@ DiagnosticsDialog::DiagnosticsDialog(const BackendDiagnostics& data,
     setWindowTitle(tr("Диагностика backend"));
     setModal(true);
 
-    // Тёмная тема приложения распространяется на диалог (наследование
-    // от MainWindow); фон задаём явно — QDialog без этого остаётся на
-    // системном (возможно, светлом) фоне.
-    setStyleSheet(QStringLiteral(R"(
-        QDialog#diagnosticsDialog { background-color: #3a3a3a; }
-        QDialog#diagnosticsDialog QLabel { color: #dddddd; }
-        QDialog#diagnosticsDialog QPushButton {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            padding: 6px 12px;
-            color: #ffffff;
-        }
-        QDialog#diagnosticsDialog QPushButton:hover {
-            background-color: #505050;
-        }
-    )"));
+    // Тема распространяется на диалог (наследование от MainWindow);
+    // собственный stylesheet задаёт фон и состояния контролов — по
+    // схеме из настроек (default — пустой, системный вид).
+    const Theme::Scheme scheme =
+        Theme::schemeFromId(AppSettings::load().style);
+    setStyleSheet(Theme::dialogStyleSheet(scheme));
+    const Theme::Colors colors = Theme::colors(scheme);
 
     m_report = formatReport(data);
 
@@ -108,7 +101,13 @@ DiagnosticsDialog::DiagnosticsDialog(const BackendDiagnostics& data,
     // запросов (закрыть и открыть снова).
     auto* note = new QLabel(tr("Снимок на момент открытия"), this);
     note->setObjectName(QStringLiteral("snapshotNote"));
-    note->setStyleSheet(QStringLiteral("color: #999999;"));
+    // Вторичный цвет схемы; системная схема не даёт цвета (invalid) —
+    // метка остаётся со системным шрифтом.
+    if (colors.dimTextColor.isValid()) {
+        note->setStyleSheet(
+            QStringLiteral("color: %1;")
+                .arg(colors.dimTextColor.name(QColor::HexRgb)));
+    }
     mainLayout->addWidget(note);
 
     auto* form = new QFormLayout;
@@ -145,14 +144,18 @@ DiagnosticsDialog::DiagnosticsDialog(const BackendDiagnostics& data,
     addRow(tr("Токенов в секунду:"), QStringLiteral("tpsValue"),
            formatTps(data));
 
-    // Последняя ошибка: возможен длинный текст — переносим; цвет —
-    // красный только при реальной ошибке.
+    // Последняя ошибка: возможен длинный текст — переносим; красный
+    // цвет схемы — только при реальной ошибке (системная схема цвет
+    // не задаёт).
     auto* errorLabel = new QLabel(formatError(data), this);
     errorLabel->setObjectName(QStringLiteral("errorValue"));
     errorLabel->setWordWrap(true);
     errorLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    if (!data.lastError.isEmpty())
-        errorLabel->setStyleSheet(QStringLiteral("color: #f44336;"));
+    if (!data.lastError.isEmpty() && colors.error.isValid()) {
+        errorLabel->setStyleSheet(
+            QStringLiteral("color: %1;")
+                .arg(colors.error.name(QColor::HexRgb)));
+    }
     form->addRow(tr("Последняя ошибка:"), errorLabel);
 
     mainLayout->addLayout(form);

@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/theme">
+        <file alias="arrow-down-on-dark.svg">theme/arrow-down-on-dark.svg</file>
+        <file alias="arrow-down-on-light.svg">theme/arrow-down-on-light.svg</file>
+    </qresource>
+</RCC>

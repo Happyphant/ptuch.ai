@@ -61,3 +61,60 @@ QVector<StyleProfile> builtinStyleProfiles()
 
     return profiles;
 }
+
+bool hasAdapter(const StyleProfile& profile)
+{
+    // adapterPath — единственный признак «адаптер объявлен»: остальные
+    // поля (type/baseModelId/promptTag/scale) без пути игнорируются.
+    return !profile.adapterPath.isEmpty();
+}
+
+QString checkAdapterCompatibility(const StyleProfile& profile,
+                                  const QString& backendBaseModelId)
+{
+    if (!hasAdapter(profile))
+        return {}; // адаптера нет — совместимость неприменима
+
+    if (profile.baseModelId.isEmpty()) {
+        return QObject::tr(
+            "адаптер не указывает baseModelId — совместимость с базовой "
+            "моделью не проверена (adapterPath=%1)")
+            .arg(profile.adapterPath);
+    }
+
+    if (backendBaseModelId.isEmpty()) {
+        return QObject::tr(
+            "базовая модель backend'а неизвестна — совместимость адаптера "
+            "«%1» не проверена")
+            .arg(profile.baseModelId);
+    }
+
+    if (QString::compare(profile.baseModelId, backendBaseModelId,
+                         Qt::CaseInsensitive)
+        != 0) {
+        return QObject::tr(
+            "адаптер обучен для базовой модели «%1», а загружена «%2» "
+            "(adapterPath=%3)")
+            .arg(profile.baseModelId, backendBaseModelId,
+                 profile.adapterPath);
+    }
+
+    return {}; // идентификаторы совпали — совместимо
+}
+
+const StyleProfile* findActiveAdapter(
+    const QVector<StyleProfile>& profiles,
+    const QVector<StyleWeight>& activeWeights)
+{
+    for (const StyleProfile& profile : profiles) {
+        if (!hasAdapter(profile) || !profile.enabled)
+            continue;
+
+        for (const StyleWeight& style : activeWeights) {
+            if (style.styleId == profile.id && style.weight > 0.0f)
+                return &profile;
+        }
+    }
+
+    return nullptr;
+}

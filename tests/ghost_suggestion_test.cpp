@@ -5,21 +5,33 @@
 #include "UI/settings_dialog.h"
 #include "UI/style_panel.h"
 #include "UI/suggestion_overlay.h"
+#include "UI/theme.h"
 #include "llama/llama_backend.h"
 #include "settings/app_settings.h"
 #include "suggestion/suggestion_controller.h"
 
+#include "qsettings_backup.h"
+
+#include <QAction>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDockWidget>
+#include <QFile>
 #include <QFontMetrics>
 #include <QImage>
+#include <QKeySequence>
+#include <QLabel>
+#include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QPixmap>
+#include <QScopeGuard>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
+#include <QTemporaryDir>
 #include <QTextCursor>
 #include <QTextDocument>
 #include <QTimer>
@@ -40,7 +52,8 @@ namespace {
 bool isOurSettingsKey(const QString& key)
 {
     return key.startsWith(QLatin1String("llama/")) ||
-           key.startsWith(QLatin1String("suggestion/"));
+           key.startsWith(QLatin1String("suggestion/")) ||
+           key.startsWith(QLatin1String("ui/"));
 }
 
 // Результат сканирования прямоугольника рендера overlay:
@@ -91,6 +104,48 @@ GhostBounds scanRegion(const QPixmap& pm, const QRect& region)
     return bounds;
 }
 
+// Пиксели в зоне ghost: фон (цвет Base viewport'а) и глифы подсказки
+// (всё прочее с ненулевой alpha). Разделение нужно, потому что после
+// появления фона ghost-глифы непрозрачны (нарисованы поверх Base) —
+// по alpha их от фона уже не отличить.
+struct GhostPixels {
+    int background = 0; // пикселей цвета Base (фон под ghost-строкой)
+    int glyphs = 0;     // пикселей, отличных от Base (глифы ghost)
+};
+
+GhostPixels classifyGhost(const QPixmap& pm, const QRect& region,
+                          const QColor& base)
+{
+    // QColor::operator== сравнивает и спецификацию (Rgb/Hsl): палитра
+    // может отдать цвет в другом spec, чем pixelColor. Сравниваем по
+    // компонентам — это то, что реально нарисовано.
+    const auto sameValue = [](const QColor& a, const QColor& b) {
+        return a.alpha() == b.alpha() && a.red() == b.red()
+               && a.green() == b.green() && a.blue() == b.blue();
+    };
+
+    const QImage img = pm.toImage();
+    GhostPixels out;
+
+    const int x0 = qMax(0, region.left());
+    const int y0 = qMax(0, region.top());
+    const int x1 = qMin(img.width() - 1, region.right());
+    const int y1 = qMin(img.height() - 1, region.bottom());
+
+    for (int y = y0; y <= y1; ++y) {
+        for (int x = x0; x <= x1; ++x) {
+            const QColor color = img.pixelColor(x, y);
+            if (color.alpha() <= kGhostPixelThreshold)
+                continue;
+            if (sameValue(color, base))
+                ++out.background;
+            else
+                ++out.glyphs;
+        }
+    }
+    return out;
+}
+
 // Редактор с текстом, курсором в конце и показанным viewport'ом.
 void prepareEditor(QPlainTextEdit& editor)
 {
@@ -101,11 +156,30 @@ void prepareEditor(QPlainTextEdit& editor)
     editor.setTextCursor(cursor);
     editor.show();
 }
+
+// Активация окна и ожидание фокуса в редакторе. macOS иногда
+// игнорирует первую activateWindow (гонка за передний план, тесты
+// запускаются из терминала) — повторяем попытку активации вплоть до
+// таймаута, но фокус всё равно обязателен (без него контроллер не
+// стартует debounce и клавиши пи мимо редактора).
+bool activateAndFocus(MainWindow& window, QPlainTextEdit& editor)
+{
+    window.activateWindow();
+    editor.setFocus();
+    return QTest::qWaitFor(
+        [&]() {
+            if (!editor.hasFocus())
+                window.activateWindow();
+            return editor.hasFocus();
+        },
+        3000);
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Проверки ghost-подсказки:
-//  1) overlay рисует полупрозрачный текст у курсора, НЕ меняя документ;
+//  1) overlay рисует ghost у курсора на непрозрачном фоне Base, НЕ
+//     меняя документ, и остаётся выровненным после скролла viewport'а;
 //  2) overlay не перехватывает мышь/фокус;
 //  3) многострочные подсказки рисуются корректно;
 //  4) длинная подсказка переносится во viewport, а не уезжает
@@ -125,7 +199,15 @@ private slots:
     void overlayIgnoresMouseAndFocus();
     void overlaySupportsMultilineSuggestion();
     void overlayWrapsLongSuggestionToViewport();
+    void overlayRealignsAfterViewportScroll();
     void keysScenario();
+    void ctrlSpaceAndFocusOutScenario();
+    void stateIndicatorShowsThemeColors();
+    void systemSchemeRestoresPlatformDefaults();
+    void documentOpenShowsNameAndClearsSuggestion();
+    void documentSaveWritesUtf8AndClearsModified();
+    void documentNewClearsEditorAndSuggestion();
+    void closeEventPromptsForUnsavedChanges();
     void settingsDialogAppliesAndPersists();
     void styleMixChangeClearsGhostSuggestion();
     void diagnosticsButtonOpensDialog(); // gated: PTUCH_DIAGNOSTICS
@@ -142,6 +224,12 @@ void GhostSuggestionTest::initTestCase()
     // UI-тесты работают на mock-бэкенде: реальный GGUF (2 ГБ) в
     // MainWindow не загружаем — иначе каждый тест тянул бы модель.
     qputenv("PTUCH_DISABLE_LLAMA", "1");
+
+    // Самовосстановление после АВАРИЙНОГО прогона (QVERIFY/QTEST_ASSERT
+    // фатальны: SIGABRT доходит до cleanupTestCase, и памятный снимок
+    // теряется) — если файл-снимок остался, вернём пользовательские
+    // ключи из него ДО нового снимка (см. qsettings_backup.h).
+    QSettingsBackup::restoreIfCrashed(isOurSettingsKey);
 
     // Снимок ВСЕХ пользовательских настроек: тесты пишут в тот же
     // файл QSettings (PtuchAI/PtuchEditor) — в т.ч. через
@@ -160,6 +248,9 @@ void GhostSuggestionTest::initTestCase()
         m_original.insert(key, settings.value(key));
         settings.remove(key);
     }
+
+    // Дубль снимка в файл — страховка от аварийного завершения (см. выше).
+    QSettingsBackup::save(m_original);
 
     // Настройки подсказок принудительно дефолтные: тайминги тестов
     // (500 мс debounce, авто-подсказки включены) не должны зависеть
@@ -183,6 +274,8 @@ void GhostSuggestionTest::cleanupTestCase()
         settings.setValue(it.key(), it.value());
     settings.sync();
     m_original.clear();
+    // Возврат выполнен штатно — файл-снимок больше не нужен.
+    QSettingsBackup::clear();
 }
 
 void GhostSuggestionTest::overlayRendersGhostWithoutTouchingDocument()
@@ -205,17 +298,23 @@ void GhostSuggestionTest::overlayRendersGhostWithoutTouchingDocument()
     const int lineStep = QFontMetrics(editor.font()).lineSpacing();
 
     // Ghost нарисован около позиции курсора (попуск на side bearing глифа).
-    const GhostBounds firstLine = scanRegion(
-        rendered, QRect(QPoint(caret.left() - 1, caret.top() - 1),
-                        QSize(200, lineStep)));
+    const QRect firstRegion(QPoint(caret.left() - 1, caret.top() - 1),
+                            QSize(200, lineStep));
+    const GhostBounds firstLine = scanRegion(rendered, firstRegion);
     QVERIFY2(firstLine.found, "Ghost-текст не нарисован у курсора");
     QVERIFY(firstLine.left <= caret.left() + 6);
     QVERIFY(firstLine.top <= caret.top() + 6);
 
-    // Полупрозрачный: видимый (alpha > 30), но не непрозрачный —
-    // pen задан с alpha 112, выше него пикселей быть не может.
-    QVERIFY(firstLine.maxAlpha >= 30);
-    QVERIFY(firstLine.maxAlpha <= 130);
+    // Под ghost-строкой непрозрачный фон цвета Base viewport'а: документ
+    // под подсказкой не просвечивает и не наезжает на призрак (вторая
+    // половина строки после курсора читается раздельно с ghost). Глифы
+    // подсказки при этом нарисованы — пиксели, отличные от Base.
+    QCOMPARE(firstLine.maxAlpha, 255);
+    const QColor base = editor.viewport()->palette().color(QPalette::Base);
+    const GhostPixels painted = classifyGhost(rendered, firstRegion, base);
+    QVERIFY2(painted.background > 0,
+             "Под ghost-строкой нет фона цвета Base viewport'а");
+    QVERIFY2(painted.glyphs > 0, "Ghost-глифы не нарисованы поверх фона");
 
     // Однострочная подсказка: второй строки нет. Зона проверки — левее
     // курсора (там, где рисовались бы строки после первой), поэтому
@@ -333,6 +432,66 @@ void GhostSuggestionTest::overlayWrapsLongSuggestionToViewport()
     QCOMPARE(editor.toPlainText(), QStringLiteral("hello"));
 }
 
+// Скролл viewport'а: QPlainTextEdit прокручивает через QWidget::scroll(),
+// а тот сдвигает дочерних (QWidgetPrivate::scrollChildren) — исторически
+// overlay уезжал из-под курсора и ghost рисовался мимо строки. После
+// moveEvent-фикса геометрия восстанавливается синхронно, а ghost — в
+// НОВОЙ позиции курсора (cursorRect пересчитывается при скролле).
+void GhostSuggestionTest::overlayRealignsAfterViewportScroll()
+{
+    QPlainTextEdit editor;
+    editor.resize(300, 120);
+
+    // Документ сильно выше viewport — прокрутка возможна.
+    QStringList lines;
+    for (int i = 0; i < 100; ++i)
+        lines.append(QStringLiteral("line %1 text for scrolling").arg(i));
+    editor.setPlainText(lines.join(QLatin1Char('\n')));
+    editor.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&editor));
+
+    // Курсор посреди документа — ПОСЛЕ show(): до layout у scroll-баров
+    // нет диапазонов, и ensureCursorVisible ничего не прокручивает.
+    QTextCursor cursor = editor.textCursor();
+    cursor.movePosition(QTextCursor::Start);
+    cursor.movePosition(QTextCursor::Down, QTextCursor::MoveAnchor, 50);
+    editor.setTextCursor(cursor);
+    editor.ensureCursorVisible();
+
+    SuggestionOverlay overlay(&editor);
+    overlay.setSuggestion(QStringLiteral("ghost"));
+    QVERIFY(overlay.isVisible());
+    QCOMPARE(overlay.geometry(), editor.viewport()->rect());
+
+    // Скролл вниз по документу: valueChanged -> scrollContentsBy ->
+    // setTopBlock -> viewport->scroll(dx, dy) -> scrollChildren со
+    // сдвигом детей и QMoveEvent.
+    auto* bar = editor.verticalScrollBar();
+    QVERIFY(bar->maximum() > bar->value() + 3);
+    bar->setValue(bar->value() + 3);
+
+    // Без восстановления геометрии overlay остался бы со сдвигом dy
+    // ( дети viewport'а сдвинуты scrollChildren ).
+    QCOMPARE(overlay.geometry(), editor.viewport()->rect());
+
+    // Ghost нарисован у курсора в ЕГО новой позиции viewport'а.
+    const QRect caret = editor.cursorRect();
+    QVERIFY2(caret.bottom() <= editor.viewport()->height(),
+             "Тест: курсор должен остаться видим после скролла");
+
+    const QPixmap rendered = renderOverlay(overlay);
+    const int lineStep = QFontMetrics(editor.font()).lineSpacing();
+    const GhostBounds bounds = scanRegion(
+        rendered, QRect(QPoint(caret.left() - 1, caret.top() - 1),
+                        QSize(200, lineStep)));
+    QVERIFY2(bounds.found, "Ghost не следует за курсором после скролла");
+    QVERIFY(bounds.left <= caret.left() + 6);
+    QVERIFY(bounds.top <= caret.top() + 6);
+
+    // Документ цел: overlay только рисует.
+    QCOMPARE(editor.toPlainText(), lines.join(QLatin1Char('\n')));
+}
+
 void GhostSuggestionTest::keysScenario()
 {
     MainWindow window;
@@ -348,9 +507,7 @@ void GhostSuggestionTest::keysScenario()
     QVERIFY(overlay);
 
     // Фокус обязателен: без него контроллер не стартует debounce.
-    window.activateWindow();
-    editor->setFocus();
-    QVERIFY(QTest::qWaitFor([&]() { return editor->hasFocus(); }, 3000));
+    QVERIFY(activateAndFocus(window, *editor));
 
     // --- Печать -> debounce (500 мс) -> mock в рабочем потоке (~300 мс).
     QTest::keyClicks(editor, QStringLiteral("hello"));
@@ -407,6 +564,564 @@ void GhostSuggestionTest::keysScenario()
     editor->setTextCursor(cursor);
     QVERIFY(!controller->hasSuggestion());
     QVERIFY(!overlay->isVisible());
+}
+
+// Ctrl+Space и потеря фокуса в живом MainWindow:
+//  1) Ctrl+Space стартует генерацию немедленно — доказательство: при
+//     искусственно увеличенном debounce (10 с) подсказки по таймеру не
+//     приходит, а после Ctrl+Space состояние меняется синхронно;
+//  2) Tab принимает ТОЛЬКО актуальную подсказку: новый символ её гасит —
+//     в документ идёт табуляция, а не устаревший текст;
+//  3) потеря фокуса прячет показанную подсказку (overlay + Idle);
+//  4) закрытие окна при активной генерации: closeEvent -> shutdown
+//     (cancel + отвязка backend) + остановка потоков — без крашей.
+void GhostSuggestionTest::ctrlSpaceAndFocusOutScenario()
+{
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    QVERIFY(editor);
+    auto* controller = window.findChild<SuggestionController*>();
+    QVERIFY(controller);
+    auto* overlay = window.findChild<SuggestionOverlay*>();
+    QVERIFY(overlay);
+
+    QVERIFY(activateAndFocus(window, *editor));
+
+    // Намеренно огромный debounce: подсказка не может прийти по таймеру.
+    controller->setDebounceInterval(10000);
+
+    // Печать уводит в Debouncing, но запрос не уходит (10 с не ждём).
+    QTest::keyClicks(editor, QStringLiteral("hello"));
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Debouncing);
+    QTest::qWait(600);
+    QVERIFY2(!controller->hasSuggestion(),
+             "При debounce 10 с подсказка не должна была прийти");
+
+    // Ctrl+Space — немедленный запрос: состояние меняется синхронно,
+    // debounce (10 с) минуется.
+    QTest::keyClick(editor, Qt::Key_Space, Qt::ControlModifier);
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Generating);
+    QVERIFY(QTest::qWaitFor(
+        [&]() { return controller->hasSuggestion(); }, 5000));
+    QVERIFY(overlay->isVisible());
+    const QString shown = controller->suggestion();
+    QVERIFY(!shown.isEmpty());
+
+    // Новый символ гасит подсказку -> Tab принимать нечего: в документ
+    // идёт табуляция, а не устаревший текст подсказки.
+    QTest::keyClick(editor, Qt::Key_X);
+    QVERIFY(!controller->hasSuggestion());
+    QTest::keyClick(editor, Qt::Key_Tab);
+    QVERIFY2(editor->toPlainText().contains(QChar('\t')),
+             "Tab без актуальной подсказки должен достаться редактору");
+    QVERIFY2(!editor->toPlainText().contains(shown),
+             "Устаревшая подсказка не должна вставляться Tab'ом");
+
+    // Свежая подсказка для проверки потери фокуса — снова Ctrl+Space.
+    QTest::keyClick(editor, Qt::Key_Space, Qt::ControlModifier);
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Generating);
+    QVERIFY(QTest::qWaitFor(
+        [&]() { return controller->hasSuggestion(); }, 5000));
+    QVERIFY(overlay->isVisible());
+
+    // Смена фокуса (переход на кнопку панели): подсказка скрыта,
+    // контроллер в Idle — её нельзя принять Tab'ом из чужого виджета.
+    auto* generateButton = window.findChild<QPushButton*>(
+        QStringLiteral("generateButton"));
+    QVERIFY(generateButton);
+    generateButton->setFocus();
+    QVERIFY(QTest::qWaitFor([&]() { return !editor->hasFocus(); }, 3000));
+    QVERIFY(!controller->hasSuggestion());
+    QVERIFY(!overlay->isVisible());
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Idle);
+
+    // Закрытие окна при активной генерации: requestSuggestion стартует
+    // и без фокуса (ручной путь), closeEvent гасит shutdown'ом.
+    QTest::keyClick(editor, Qt::Key_Space, Qt::ControlModifier);
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Generating);
+
+    // Без несохранённых изменений — иначе closeEvent спросит про
+    // сохранение (подтверждение при закрытии проверяется отдельно в
+    // closeEventPromptsForUnsavedChanges).
+    editor->document()->setModified(false);
+    window.close();
+    QCOMPARE(controller->state(),
+             SuggestionController::State::Idle);
+    QVERIFY(!controller->hasSuggestion());
+    // Деструктор на выходе из скоупа: shutdown (идемпотентно) +
+    // quit/wait потоков — при нарушении тест зависнет или упадёт.
+}
+
+// Индикатор состояния в живом MainWindow использует цвета темы
+// (схема ПТЮЧ по умолчанию): стартовое Ready (зелёный), печать ->
+// Waiting (янтарный), пустой документ + Ctrl+Space -> Error (красный).
+// Состояние Generating (электрик-синий) закрыто в tests/theme_test.cpp
+// (Theme::stateColor): окно генерации в UI слишком мало для
+// детерминированной ловли.
+void GhostSuggestionTest::stateIndicatorShowsThemeColors()
+{
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    QVERIFY(editor);
+    auto* controller = window.findChild<SuggestionController*>();
+    QVERIFY(controller);
+    auto* indicator = window.findChild<QLabel*>(
+        QStringLiteral("stateIndicator"));
+    QVERIFY(indicator);
+
+    using State = SuggestionController::State;
+
+    // Стартовое состояние: Ready с зелёным цветом схемы ПТЮЧ
+    // (initTestCase чистит ui/style -> дефолт «ptuch»).
+    QCOMPARE(indicator->text(), QStringLiteral("Ready"));
+    QVERIFY(indicator->styleSheet().contains(
+        Theme::stateColor(Theme::Scheme::Ptuch, State::Idle)
+            .name(QColor::HexRgb)));
+
+    QVERIFY(activateAndFocus(window, *editor));
+    // Намеренно огромный debounce: состояние Debouncing удерживается
+    // (по таймеру подсказка не приходит).
+    controller->setDebounceInterval(10000);
+
+    // Печать -> Debouncing: Waiting + янтарный цвет схемы.
+    QTest::keyClicks(editor, QStringLiteral("hello"));
+    QCOMPARE(controller->state(), State::Debouncing);
+    QCOMPARE(indicator->text(), QStringLiteral("Waiting"));
+    QVERIFY(indicator->styleSheet().contains(
+        Theme::stateColor(Theme::Scheme::Ptuch, State::Debouncing)
+            .name(QColor::HexRgb)));
+
+    // Пустой документ + Ctrl+Space -> «Пустой контекст»: ручной запуск
+    // не может пройти мимо — состояние уходит в Error (красный схемы).
+    editor->clear();
+    QTest::keyClick(editor, Qt::Key_Space, Qt::ControlModifier);
+    QCOMPARE(controller->state(), State::Error);
+    QCOMPARE(indicator->text(), QStringLiteral("Error"));
+    QVERIFY(indicator->styleSheet().contains(
+        Theme::stateColor(Theme::Scheme::Ptuch, State::Error)
+            .name(QColor::HexRgb)));
+}
+
+// Системная схема («default») через комбобокс стиля в Settings:
+// применяется сразу — stylesheet'ы окна и панели сняты, индикатор
+// без инлайнового цвета, палитра приложения возвращается к системному
+// снимку до темизации (цвета шрифтов и контролов платформенные).
+void GhostSuggestionTest::systemSchemeRestoresPlatformDefaults()
+{
+    // Снимок ДО создания окна: конструктор MainWindow снимает палитру
+    // первым действием, а System возвращает её же — до и после равны.
+    const QPalette before = qApp->palette();
+    // Возврат схемы — даже при падении QVERIFY (иначе каскад сбоев
+    // в последующих тестах).
+    const QString previousStyle = AppSettings::load().style;
+    const auto restoreStyle = qScopeGuard([&]() {
+        AppSettings values = AppSettings::load();
+        values.style = previousStyle;
+        values.save();
+    });
+
+    MainWindow window;
+    auto* settingsButton = window.findChild<QPushButton*>(
+        QStringLiteral("settingsButton"));
+    QVERIFY2(settingsButton, "Кнопка Settings не создана");
+
+    bool styleApplied = false;
+    // click() -> openSettings() -> dialog.exec() (вложенный event
+    // loop): таймер срабатывает внутри exec и закрывает диалог.
+    QTimer::singleShot(0, &window, [&]() {
+        auto* dialog = window.findChild<SettingsDialog*>(
+            QStringLiteral("settingsDialog"));
+        if (dialog == nullptr)
+            return;
+        auto* styleCombo = dialog->findChild<QComboBox*>(
+            QStringLiteral("styleCombo"));
+        if (styleCombo == nullptr)
+            return;
+        const int index = styleCombo->findData(
+            QLatin1String(AppSettings::styleSystem));
+        if (index < 0)
+            return;
+        styleCombo->setCurrentIndex(index);
+        styleApplied = true;
+        dialog->accept();
+    });
+
+    settingsButton->click(); // модальный exec до accept()
+    QVERIFY2(styleApplied, "Комбобокс стиля не найден");
+
+    // 1) Схема сохранена (та же строка, что читает Theme::schemeFromId).
+    QCOMPARE(AppSettings::load().style,
+             QLatin1String(AppSettings::styleSystem));
+
+    // 2) Палитра приложения — снимок до темизации (цвета шрифтов
+    //    вернулись к системным).
+    QCOMPARE(qApp->palette(), before);
+
+    // 3) Stylesheet'ы сняты: окно и панель стилизованы системно.
+    QVERIFY(window.styleSheet().isEmpty());
+    auto* panel = window.findChild<StylePanel*>(
+        QStringLiteral("stylePanel"));
+    QVERIFY(panel);
+    QVERIFY(panel->styleSheet().isEmpty());
+
+    // Маркеры профилей: цвет профиля (данные) остаётся, декора нет.
+    auto* marker = window.findChild<QLabel*>(
+        QStringLiteral("colorMarker_pushkin"));
+    QVERIFY(marker);
+    QVERIFY(marker->styleSheet().contains(
+        QStringLiteral("background-color")));
+    QVERIFY(!marker->styleSheet().contains(
+        QStringLiteral("border-radius")));
+
+    // 4) Индикатор состояния: заголовок есть, инлайнового цвета нет.
+    auto* indicator = window.findChild<QLabel*>(
+        QStringLiteral("stateIndicator"));
+    QVERIFY(indicator);
+    QCOMPARE(indicator->text(), QStringLiteral("Ready"));
+    QVERIFY(indicator->styleSheet().isEmpty());
+}
+
+// Открытие файла (ядро openFile, без диалога):
+//  - русский текст файла в редакторе (UTF-8), modified сброшен;
+//  - имя файла и «не изменён» видны в индикаторе и заголовке;
+//  - показанная подсказка очищена (overlay скрыт, Idle);
+//  - генерация НЕ стартует ни во время загрузки, ни после неё:
+//    debounce не запланирован — состояние остаётся Idle дольше
+//    интервала (500 мс из initTestCase).
+void GhostSuggestionTest::documentOpenShowsNameAndClearsSuggestion()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("notes.txt"));
+    const QString content = QStringLiteral("Русский текст открытия: ёжик.");
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(content.toUtf8()), content.toUtf8().size());
+    }
+
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    auto* controller = window.findChild<SuggestionController*>();
+    auto* overlay = window.findChild<SuggestionOverlay*>();
+    auto* indicator =
+        window.findChild<QLabel*>(QStringLiteral("documentIndicator"));
+    QVERIFY(editor && controller && overlay && indicator);
+
+    QVERIFY(activateAndFocus(window, *editor));
+
+    // Показываем подсказку и правим текст (документ «изменён»).
+    QTest::keyClicks(editor, QStringLiteral("hello"));
+    QVERIFY(QTest::qWaitFor([&]() { return controller->hasSuggestion(); },
+                            5000));
+    QVERIFY(overlay->isVisible());
+    QVERIFY(editor->document()->isModified());
+    // maybeSave не должен мешать: подтверждение несохранённых
+    // изменений проверяется в closeEventPromptsForUnsavedChanges.
+    editor->document()->setModified(false);
+
+    // Открываем ПОКА подсказка показана и debounce активен.
+    QVERIFY(window.openFile(path));
+
+    // Документ: текст файла, modified сброшен, имя в индикаторе/заголовке.
+    QCOMPARE(editor->toPlainText(), content);
+    QVERIFY(!editor->document()->isModified());
+    QVERIFY(!window.isWindowModified());
+    QVERIFY(indicator->text().contains(QStringLiteral("notes.txt")));
+    QVERIFY(indicator->text().contains(QStringLiteral(" • не изменён")));
+    QVERIFY(window.windowTitle().contains(QStringLiteral("notes.txt")));
+
+    // Подсказка очищена, контроллер снова включён и в Idle.
+    QVERIFY(!controller->hasSuggestion());
+    QVERIFY(!overlay->isVisible());
+    QVERIFY(controller->isEnabled());
+    QCOMPARE(controller->state(), SuggestionController::State::Idle);
+
+    // Генерация во время/после загрузки не стартует: ждём дольше
+    // debounce — ни состояния Debouncing/Generating, ни подсказки.
+    QTest::qWait(900);
+    QCOMPARE(controller->state(), SuggestionController::State::Idle);
+    QVERIFY(!controller->hasSuggestion());
+}
+
+// Ctrl+S (actionSave) при открытом файле: диалог не нужен, русский
+// текст пишется байтами UTF-8, modified гаснет, индикатор показывает
+// «не изменён». Горячая клавиша закреплена за Save-действием.
+void GhostSuggestionTest::documentSaveWritesUtf8AndClearsModified()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("save.txt"));
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly)); // пустой — есть что править
+    }
+
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    auto* indicator =
+        window.findChild<QLabel*>(QStringLiteral("documentIndicator"));
+    QVERIFY(editor && indicator);
+
+    auto* saveAction =
+        window.findChild<QAction*>(QStringLiteral("actionSave"));
+    QVERIFY(saveAction);
+    // Горячая клавиша сохранения: Ctrl+S (Cmd+S на macOS).
+    QCOMPARE(saveAction->shortcut(), QKeySequence::Save);
+
+    QVERIFY(activateAndFocus(window, *editor));
+
+    QVERIFY(window.openFile(path));
+    const QString typed =
+        QStringLiteral("Новый русский текст: сохраняется ёЁ.");
+    // QTest::keyClicks падает на не-ASCII (таблица Qt Test — только
+    // латиница); вставка напрямую даёт те же сигналы документа.
+    editor->insertPlainText(typed);
+    QCOMPARE(editor->toPlainText(), typed);
+    QVERIFY(editor->document()->isModified());
+    QVERIFY(indicator->text().contains(QStringLiteral(" • изменён")));
+    QVERIFY(window.isWindowModified());
+
+    saveAction->trigger();
+
+    // Байты файла — ровно UTF-8 русского текста (без BOM).
+    QFile saved(path);
+    QVERIFY(saved.open(QIODevice::ReadOnly));
+    QCOMPARE(saved.readAll(), typed.toUtf8());
+    QVERIFY(!typed.toUtf8().startsWith("\xEF\xBB\xBF"));
+
+    QVERIFY(!editor->document()->isModified());
+    QVERIFY(!window.isWindowModified());
+    QVERIFY(indicator->text().contains(QStringLiteral(" • не изменён")));
+    QVERIFY(window.statusBar()->currentMessage().contains(
+        QStringLiteral("Сохранено")));
+}
+
+// Ctrl+N (actionNew): редактор пуст, «Без имени» (путь сброшен),
+// modified сброшен, показанная подсказка очищена, генерация не
+// стартует. Клавиши остальных команд документа тоже закреплены.
+void GhostSuggestionTest::documentNewClearsEditorAndSuggestion()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("new.txt"));
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+    }
+
+    MainWindow window;
+    window.resize(1000, 700);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto* editor =
+        window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+    auto* controller = window.findChild<SuggestionController*>();
+    auto* overlay = window.findChild<SuggestionOverlay*>();
+    auto* indicator =
+        window.findChild<QLabel*>(QStringLiteral("documentIndicator"));
+    QVERIFY(editor && controller && overlay && indicator);
+
+    // Все команды документа привязаны к своим горячим клавишам.
+    auto* newAction =
+        window.findChild<QAction*>(QStringLiteral("actionNew"));
+    auto* openAction =
+        window.findChild<QAction*>(QStringLiteral("actionOpen"));
+    auto* saveAsAction =
+        window.findChild<QAction*>(QStringLiteral("actionSaveAs"));
+    QVERIFY(newAction && openAction && saveAsAction);
+    QCOMPARE(newAction->shortcut(), QKeySequence::New);
+    QCOMPARE(openAction->shortcut(), QKeySequence::Open);
+    QCOMPARE(saveAsAction->shortcut(), QKeySequence::SaveAs);
+
+    QVERIFY(activateAndFocus(window, *editor));
+
+    // Был открыт файл и показана подсказка.
+    QVERIFY(window.openFile(path));
+    // Не-ASCII — вставка напрямую (keyClicks падает на кириллице).
+    editor->insertPlainText(QStringLiteral("лишний текст"));
+    QVERIFY(QTest::qWaitFor([&]() { return controller->hasSuggestion(); },
+                            5000));
+    QVERIFY(overlay->isVisible());
+    editor->document()->setModified(false); // без запроса maybeSave (см. выше)
+
+    newAction->trigger();
+
+    QVERIFY(editor->toPlainText().isEmpty());
+    QVERIFY(!editor->document()->isModified());
+    QVERIFY(!window.isWindowModified());
+    QVERIFY(indicator->text().contains(QStringLiteral("Без имени")));
+    QVERIFY(window.windowTitle().contains(QStringLiteral("Без имени")));
+    QVERIFY(!controller->hasSuggestion());
+    QVERIFY(!overlay->isVisible());
+    QCOMPARE(controller->state(), SuggestionController::State::Idle);
+
+    // Генерация после «Нового» не стартует сама.
+    QTest::qWait(700);
+    QCOMPARE(controller->state(), SuggestionController::State::Idle);
+    QVERIFY(!controller->hasSuggestion());
+}
+
+// Close event с запросом о несохранённых изменениях — три решения:
+//  1) Cancel: окно остаётся открытым, shutdown НЕ выполнялся —
+//     контроллер жив, подсказка после отмены всё ещё работает;
+//  2) Discard: окно закрывается, файл не тронут;
+//  3) Save: окно закрывается, правки записаны (путь уже известен —
+//     без диалога выбора файла).
+void GhostSuggestionTest::closeEventPromptsForUnsavedChanges()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("close.txt"));
+    const QByteArray original =
+        QStringLiteral("старое содержимое").toUtf8();
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(original), original.size());
+    }
+
+    const auto readFile = [&path]() {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly))
+            return QByteArray();
+        return file.readAll();
+    };
+
+    // --- (1) Cancel: остаёмся в окне, контроллер жив -------------------
+    {
+        MainWindow window;
+        window.resize(1000, 700);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        auto* editor =
+            window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+        auto* controller = window.findChild<SuggestionController*>();
+        QVERIFY(editor && controller);
+
+        QVERIFY(activateAndFocus(window, *editor));
+
+        QVERIFY(window.openFile(path));
+        editor->insertPlainText(QStringLiteral(" и правка"));
+        QVERIFY(editor->document()->isModified());
+
+        QTimer::singleShot(0, &window, [&window]() {
+            auto* box = window.findChild<QMessageBox*>();
+            if (box != nullptr) {
+                QAbstractButton* cancel =
+                    box->button(QMessageBox::Cancel);
+                if (cancel != nullptr)
+                    cancel->click();
+            }
+        });
+        window.close();
+
+        QVERIFY2(window.isVisible(),
+                 "Cancel должен оставить окно открытым");
+        QVERIFY(window.isWindowModified());
+        QVERIFY2(controller->isEnabled(),
+                 "После отмены closeEvent не должен останавливать "
+                 "контроллер (shutdown не выполнялся)");
+        QVERIFY(!controller->hasSuggestion());
+
+        // Подсказки работают после отмены: контроллер не отвязан.
+        QVERIFY(activateAndFocus(window, *editor));
+        editor->insertPlainText(QStringLiteral(" ещё"));
+        QVERIFY(QTest::qWaitFor(
+            [&]() { return controller->hasSuggestion(); }, 5000));
+    }
+    // Ни одно из решений не записало файл — Cancel тем более.
+    QCOMPARE(readFile(), original);
+
+    // --- (2) Discard: закрываемся, файл не тронут ----------------------
+    {
+        MainWindow window;
+        window.resize(1000, 700);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        auto* editor =
+            window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+        QVERIFY(editor);
+        QVERIFY(window.openFile(path));
+        editor->insertPlainText(QStringLiteral(" отменённая правка"));
+        QVERIFY(editor->document()->isModified());
+
+        QTimer::singleShot(0, &window, [&window]() {
+            auto* box = window.findChild<QMessageBox*>();
+            if (box != nullptr) {
+                QAbstractButton* discard =
+                    box->button(QMessageBox::Discard);
+                if (discard != nullptr)
+                    discard->click();
+            }
+        });
+        window.close();
+
+        QVERIFY(!window.isVisible());
+        QCOMPARE(readFile(), original);
+    }
+
+    // --- (3) Save: закрываемся, правки в файле -------------------------
+    {
+        MainWindow window;
+        window.resize(1000, 700);
+        window.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+        auto* editor =
+            window.findChild<QPlainTextEdit*>(QStringLiteral("mainEditor"));
+        QVERIFY(editor);
+
+        QVERIFY(window.openFile(path));
+        QTextCursor cursor = editor->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        editor->setTextCursor(cursor);
+        const QString typed = QStringLiteral(" и сохранённая правка");
+        editor->insertPlainText(typed);
+        QVERIFY(editor->document()->isModified());
+
+        QTimer::singleShot(0, &window, [&window]() {
+            auto* box = window.findChild<QMessageBox*>();
+            if (box != nullptr) {
+                QAbstractButton* save =
+                    box->button(QMessageBox::Save);
+                if (save != nullptr)
+                    save->click();
+            }
+        });
+        window.close();
+
+        QVERIFY(!window.isVisible());
+        QCOMPARE(readFile(), original + typed.toUtf8());
+    }
 }
 
 // Кнопка Settings в панели -> диалог -> применение настроек: контроллер
@@ -491,9 +1206,7 @@ void GhostSuggestionTest::styleMixChangeClearsGhostSuggestion()
     QVERIFY2(dock, "QDockWidget стилей не создан");
 
     // Фокус обязателен: без него контроллер не стартует debounce.
-    window.activateWindow();
-    editor->setFocus();
-    QVERIFY(QTest::qWaitFor([&]() { return editor->hasFocus(); }, 3000));
+    QVERIFY(activateAndFocus(window, *editor));
 
     // Печать -> debounce (500 мс) -> mock (~300 мс) -> ghost показан.
     QTest::keyClicks(editor, QStringLiteral("hello"));

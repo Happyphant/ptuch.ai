@@ -29,6 +29,12 @@ struct AppSettings
     int debounceMs = 500;
     bool autoSuggestions = true;
 
+    // Тема: схема оформления (см. src/UI/theme.h). "default" —
+    // системные цвета шрифтов и контролов, "ptuch" — тёмная тема
+    // ПТЮЧ.AI (дефолт), "light" — светлая. Допустимые id — константы
+    // style* ниже; sanitize() отбрасывает прочие значения.
+    QString style = QLatin1String(stylePtuch);
+
     // Диапазоны — единый источник истины для виджетов и sanitize().
     static constexpr int contextSizeMin = 256;
     static constexpr int contextSizeMax = 8192;
@@ -54,6 +60,11 @@ struct AppSettings
     static constexpr const char* keyDebounceMs = "suggestion/debounceMs";
     static constexpr const char* keyAutoSuggestions =
         "suggestion/autoSuggestions";
+    // Схема темы: id — styleSystem/stylePtuch/styleLight.
+    static constexpr const char* keyStyle = "ui/style";
+    static constexpr const char* styleSystem = "default";
+    static constexpr const char* stylePtuch = "ptuch";
+    static constexpr const char* styleLight = "light";
 
     // Чтение из QSettings + санитизация диапазонами: возвращаемое
     // значение ВСЕГДА валидно для контроллера и LlamaBackend.

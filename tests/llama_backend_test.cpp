@@ -26,6 +26,7 @@ private slots:
     void resolveModelPath_prefersEnvPath();
     void resolveModelPath_ignoresMissingEnvPath();
     void generate_withoutModel_reportsError();
+    void generate_withAdapter_reportsUnsupported();
     void generate_fromForeignThread_isAsync();
     void cancel_unknownId_keepsBackendUsable();
     void diagnostics_reportsModelInfo();
@@ -110,6 +111,44 @@ void LlamaBackendTest::generate_withoutModel_reportsError()
     // без указателей/адресов (так и показывается в UI).
     const BackendDiagnostics diag = m_backend->diagnostics();
     QVERIFY2(diag.lastError.contains(QStringLiteral("не загружена")),
+             qPrintable(diag.lastError));
+}
+
+// Адаптеры (LoRA) не реализованы: контракт интерфейса — при
+// supportsAdapters()==false бэкенд отвечает ЯВНОЙ ошибкой на
+// adapterPath, а не тихо игнорирует и не «грузит» ничего фиктивного.
+// Отказ идёт ДО загрузки модели и без llama-вызовов (см. README
+// «Стили и LoRA-адаптеры»).
+void LlamaBackendTest::generate_withAdapter_reportsUnsupported()
+{
+    QVERIFY(!m_backend->supportsAdapters());
+
+    QSignalSpy errorSpy(m_backend,
+                        &ITextGenerationBackend::generationError);
+
+    GenerationRequest request;
+    request.requestId = 77;
+    request.context = QStringLiteral("hello");
+    request.adapter.path = QStringLiteral("/models/style-lora.safetensors");
+    request.adapter.baseModelId = QStringLiteral("qwen2.5-3b");
+
+    m_backend->generate(request);
+
+    QCOMPARE(errorSpy.count(), 1);
+    QCOMPARE(errorSpy.first().at(0).toULongLong(), quint64(77));
+    const QString message = errorSpy.first().at(1).toString();
+    QVERIFY2(message.contains(QStringLiteral("не поддерживает адаптеры")),
+             qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("style-lora.safetensors")),
+             qPrintable(message));
+
+    // Ни загрузки модели, ни фиктивной генерации.
+    QVERIFY(!m_backend->isModelLoaded());
+
+    // Ошибка отражена в снимке диагностики (её и показывает UI).
+    const BackendDiagnostics diag = m_backend->diagnostics();
+    QVERIFY2(diag.lastError.contains(
+                 QStringLiteral("не поддерживает адаптеры")),
              qPrintable(diag.lastError));
 }
 

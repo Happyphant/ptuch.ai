@@ -2,6 +2,7 @@
 #pragma once
 
 #include "suggestion/style_mixer.h"
+#include "theme.h" // Theme::Scheme (схема темы панели)
 
 #include <QHash>
 #include <QWidget>
@@ -22,6 +23,13 @@ class QSlider;
 // и активность считает модель (activeTotal()/styleWeights()), не
 // виджеты.
 //
+// Нейтральность относительно адаптеров (LoRA): панель отображает
+// ТОЛЬКО нейтральные поля профиля (имя, описание, цвет, вес,
+// включение) — поля adapterPath/adapterType/baseModelId/promptTag/
+// adapterScale она не рисует и не интерпретирует, никаких типов
+// библиотек обучения в панели нет (см. style_profile.h и README
+// «Стили и LoRA-адаптеры»: MVP микшует стили через prompt).
+//
 // Единый сигнал styleMixChanged: нормализованные веса активных
 // профилей (сумма 1.0) — готовы к SuggestionController::setStyleMix.
 // Испускается ровно один раз на одно действие пользователя (слайдер,
@@ -36,9 +44,12 @@ class QSlider;
 //  - стартовые значения выставляются ДО подключения сигналов —
 //    построение панели не «изменение микса».
 //
-// Тёмная тема: панель приносит собственный stylesheet (тёмный фон,
-// светлый текст, акцент #42a5f5) — корректно выглядит и внутри
-// MainWindow, и отдельно от него.
+// Тема: панель приносит собственный stylesheet из модуля темы
+// (Theme::panelStyleSheet — фон/текст/акценты выбранной схемы)
+// — корректно выглядит и внутри MainWindow, и отдельно от него.
+// Схема (default / ПТЮЧ / светлый) переключается setScheme —
+// её зовёт MainWindow из ui/style (default снимает stylesheet
+// совсем — контролы панели становятся системными).
 class StylePanel final : public QWidget
 {
     Q_OBJECT
@@ -47,6 +58,10 @@ public:
     explicit StylePanel(QWidget* parent = nullptr);
     // DI: свой микшер (например, восстановленный из настроек).
     explicit StylePanel(StyleMixer mixer, QWidget* parent = nullptr);
+
+    // Схема темы панели: пересборка stylesheet'а панели и цветовых
+    // маркеров профилей (default — пустые, системный вид).
+    void setScheme(Theme::Scheme scheme);
 
     // Модель данных (не виджет): для проверок и будущего сохранения.
     const StyleMixer& mixer() const { return m_mixer; }
@@ -74,9 +89,14 @@ private:
     // Общая точка изменений: модель уже обновлена обработчиком —
     // освежить подписи и испустить ровно один styleMixChanged.
     void notifyMixChanged();
+    // Применение темы: stylesheet панели + маркеры профилей
+    // (цвет профиля + рамка/радиус схемы) по текущему m_scheme.
+    void applyPanelTheme();
 
     StyleMixer m_mixer; // модель — вне виджетов
     QHash<QString, Row> m_rows;
     QLabel* m_sumLabel = nullptr;
     QPushButton* m_resetMixButton = nullptr;
+    // Активная схема темы (см. Theme::panelStyleSheet).
+    Theme::Scheme m_scheme = Theme::Scheme::Ptuch;
 };

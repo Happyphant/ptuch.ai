@@ -1,6 +1,8 @@
 // style_panel.cpp
 #include "style_panel.h"
 
+#include "theme.h"
+
 #include <QCheckBox>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -16,104 +18,6 @@ namespace {
 QString formatWeight(double weight)
 {
     return QString::number(weight, 'f', 2);
-}
-
-// Собственный stylesheet панели: тёмная тема не зависит от хоста —
-// панель корректна и в MainWindow, и в других контейнерах.
-// Цвета согласованы с палитрой приложения (#3a3a3a / #dddddd /
-// акцент #42a5f5); маркер цвета профиля задаётся отдельно на QLabel.
-QString panelStyleSheet()
-{
-    return QStringLiteral(R"(
-        StylePanel {
-            background-color: #3a3a3a;
-        }
-
-        QLabel {
-            color: #dddddd;
-            background: transparent;
-        }
-
-        QLabel#sumLabel {
-            color: #f0f0f0;
-            font-weight: bold;
-        }
-
-        QSlider::groove:horizontal {
-            height: 4px;
-            background: #565656;
-            border-radius: 2px;
-        }
-
-        QSlider::sub-page:horizontal {
-            background: #42a5f5;
-            border-radius: 2px;
-        }
-
-        QSlider::handle:horizontal {
-            background: #f0f0f0;
-            border: 1px solid #42a5f5;
-            width: 12px;
-            margin: -5px 0;
-            border-radius: 6px;
-        }
-
-        /* Выключенный стиль: слайдер гаснет, но остаётся читаемым. */
-        QSlider::groove:horizontal:disabled {
-            background: #4a4a4a;
-        }
-
-        QSlider::sub-page:horizontal:disabled {
-            background: #5a6f8a;
-        }
-
-        QSlider::handle:horizontal:disabled {
-            background: #8a8a8a;
-            border: 1px solid #6a6a6a;
-        }
-
-        QCheckBox {
-            color: #dddddd;
-            spacing: 6px;
-            background: transparent;
-        }
-
-        QCheckBox::indicator {
-            width: 14px;
-            height: 14px;
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 3px;
-        }
-
-        QCheckBox::indicator:checked {
-            background-color: #42a5f5;
-            border: 1px solid #6ab0f3;
-        }
-
-        QCheckBox:disabled {
-            color: #8a8a8a;
-        }
-
-        QPushButton#resetMixButton,
-        QPushButton[kind="styleReset"] {
-            background-color: #454545;
-            border: 1px solid #565656;
-            border-radius: 4px;
-            color: #ffffff;
-            padding: 4px 8px;
-        }
-
-        QPushButton#resetMixButton:hover,
-        QPushButton[kind="styleReset"]:hover {
-            background-color: #505050;
-        }
-
-        QPushButton#resetMixButton:pressed,
-        QPushButton[kind="styleReset"]:pressed {
-            background-color: #333333;
-        }
-    )");
 }
 
 } // namespace
@@ -134,7 +38,31 @@ StylePanel::StylePanel(StyleMixer mixer, QWidget* parent)
 
     buildUi();
     refreshLabels(); // стартовое состояние — без сигналов (до connect)
-    setStyleSheet(panelStyleSheet());
+    applyPanelTheme(); // stylesheet панели + маркеры профилей
+}
+
+void StylePanel::setScheme(Theme::Scheme scheme)
+{
+    if (m_scheme == scheme)
+        return;
+    m_scheme = scheme;
+    applyPanelTheme();
+}
+
+void StylePanel::applyPanelTheme()
+{
+    setStyleSheet(Theme::panelStyleSheet(m_scheme));
+
+    // Цветовой маркер: цвет профиля + рамка/радиус схемы (у
+    // системной схемы — нейтральная рамка без радиуса).
+    for (const StyleProfile& profile : m_mixer.profiles()) {
+        auto* marker = findChild<QLabel*>(
+            QStringLiteral("colorMarker_%1").arg(profile.id));
+        if (marker != nullptr) {
+            marker->setStyleSheet(Theme::colorMarkerStyle(
+                profile.color, m_scheme));
+        }
+    }
 }
 
 void StylePanel::buildUi()
@@ -160,9 +88,7 @@ void StylePanel::buildUi()
         marker->setFixedSize(14, 14);
         marker->setToolTip(profile.description);
         marker->setStyleSheet(
-            QStringLiteral("background-color: %1; "
-                           "border: 1px solid #565656; border-radius: 7px;")
-                .arg(profile.color.name(QColor::HexRgb)));
+            Theme::colorMarkerStyle(profile.color, m_scheme));
         grid->addWidget(marker, rowIndex, 0, Qt::AlignVCenter);
 
         auto* nameLabel = new QLabel(profile.displayName, this);

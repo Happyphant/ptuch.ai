@@ -3,6 +3,7 @@
 
 #include "backend/text_generation_backend.h"
 #include "document_state.h"
+#include "style_profile.h" // StyleProfile (проверка адаптеров)
 
 #include <QObject>
 #include <QString>
@@ -82,6 +83,12 @@ public:
 
     // Смесь стилей для backend (захватывается в контекст запроса).
     void setStyleMix(QVector<StyleWeight> mix);
+    // Профили стилей (нейтральные данные: QString/double, без
+    // библиотек обучения) — для проверки адаптеров перед отправкой
+    // запроса. В MVP вызывается один раз при старте (профили статичны);
+    // изменения весов идут как прежде через setStyleMix. Сам сеттер
+    // ничего не сбрасывает — только обновляет вход проверки.
+    void setStyleProfiles(QVector<StyleProfile> profiles);
     // DI-точка подмены: mock -> реальный backend (llama) без изменения
     // контроллера. Активный запрос при смене отменяется как устаревший.
     // Контроллер backend не владеет.
@@ -129,6 +136,12 @@ public slots:
     // Приём изменений документа/курсора (подключается сигналами редактора).
     void onTextChanged();
     void onCursorPositionChanged();
+    // Потеря фокуса редактором (MainWindow::eventFilter): фокус — часть
+    // актуальности подсказки. Показанная подсказка скрывается, debounce
+    // гасится, запрос «в полёте» отменяется — его поздний ответ не
+    // воскреснет подсказку в неактивном редакторе и не уведёт состояние
+    // в Error лишь из-за того, что фокус ушёл.
+    void onFocusLost();
     // Следующая альтернатива (Shift+Tab).
     void requestAlternative();
 
@@ -169,6 +182,8 @@ private:
     QTimer m_debounceTimer;
 
     QVector<StyleWeight> m_styles;
+    // Профили (вход проверки адаптеров; пусто = проверять нечего).
+    QVector<StyleProfile> m_styleProfiles;
 
     DocumentState m_documentState;
 

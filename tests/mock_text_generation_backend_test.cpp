@@ -21,8 +21,10 @@ private slots:
     void returnsResultAfterDelayInWorkerThread();
     void concurrentRequestsKeepTheirRequestIds();
     void errorSimulation();
+    void configuredResultTextIsReturned();
     void cancelSuppressesResponse();
     void ignoreCancelStillResponds();
+    void adapterRequestRejectedExplicitly();
 
 private:
     QThread* thread = nullptr;
@@ -155,6 +157,32 @@ void MockTextGenerationBackendTest::errorSimulation()
     QVERIFY(!errorSpy->at(0).at(1).toString().isEmpty());
 }
 
+// Детерминированный результат: заданный текст возвращается байт-в-байт
+// (без автоподсказки по контексту) — тесты могут фиксировать ответ mock'а.
+void MockTextGenerationBackendTest::configuredResultTextIsReturned()
+{
+    backend->setResultText(
+        QStringLiteral(" deterministic \"answer\" из mock"));
+    backend->setDelayMs(50); // до старта потока
+    thread->start();
+
+    GenerationRequest request;
+    request.requestId = 11;
+    request.context = QStringLiteral("hello");
+    backend->generate(request);
+
+    QVERIFY(QTest::qWaitFor(
+        [this]() { return readySpy->count() == 1; }, 3000));
+
+    const GenerationResult result =
+        readySpy->at(0).at(0).value<GenerationResult>();
+    QCOMPARE(result.requestId, quint64(11));
+    // Ровно заданный текст: контекст на результат не влияет.
+    QCOMPARE(result.generatedText,
+             QStringLiteral(" deterministic \"answer\" из mock"));
+    QCOMPARE(result.stopReason, QStringLiteral("stop"));
+}
+
 void MockTextGenerationBackendTest::cancelSuppressesResponse()
 {
     thread->start();
@@ -196,6 +224,34 @@ void MockTextGenerationBackendTest::ignoreCancelStillResponds()
         readySpy->at(0).at(0).value<GenerationResult>();
     QCOMPARE(result.requestId, quint64(9));
     QCOMPARE(result.stopReason, QStringLiteral("cancelled"));
+}
+
+// Адаптеры (LoRA): контракт интерфейса — mock их не поддерживает
+// (supportsAdapters()==false) и на запрос с adapterPath отвечает
+// ЯВНОЙ ошибкой с путём, а не тихим игнором и не фиктивной генерацией.
+void MockTextGenerationBackendTest::adapterRequestRejectedExplicitly()
+{
+    QVERIFY(!backend->supportsAdapters());
+
+    GenerationRequest request;
+    request.requestId = 7;
+    request.context = QStringLiteral("hello");
+    request.adapter.path = QStringLiteral("/models/style-lora.safetensors");
+
+    // Поток не запускаем: отказ синхронный, до постановки в очередь.
+    backend->generate(request);
+
+    QCOMPARE(errorSpy->count(), 1);
+    QCOMPARE(errorSpy->at(0).at(0).toULongLong(), quint64(7));
+    const QString message = errorSpy->at(0).at(1).toString();
+    QVERIFY2(message.contains(QStringLiteral("не поддерживает адаптеры")),
+             qPrintable(message));
+    QVERIFY2(message.contains(QStringLiteral("style-lora.safetensors")),
+             qPrintable(message));
+
+    // Ни результата, ни отложенной работы.
+    QTest::qWait(50);
+    QCOMPARE(readySpy->count(), 0);
 }
 
 QTEST_GUILESS_MAIN(MockTextGenerationBackendTest)

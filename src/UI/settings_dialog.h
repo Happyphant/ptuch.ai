@@ -2,10 +2,12 @@
 #pragma once
 
 #include "settings/app_settings.h"
+#include "theme.h" // Theme::Scheme (схема темы диалога)
 
 #include <QDialog>
 
 class QCheckBox;
+class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -16,7 +18,8 @@ class LlamaBackend;
 
 // Диалог настроек (QSettings): путь к GGUF-модели, размер контекста,
 // максимум новых токенов, temperature, top-p, GPU-слои, интервал
-// debounce и включение автоматических подсказок.
+// debounce, включение автоматических подсказок и выбор стиля
+// (default / ПТЮЧ / светлый; см. src/UI/theme.h).
 //
 // Валидация: числовые поля — QSpinBox/QDoubleSpinBox с диапазонами из
 // AppSettings (полем выйти за границы нельзя), settings() санируется
@@ -65,6 +68,9 @@ private:
     QSpinBox* m_gpuLayersEdit = nullptr;
     QSpinBox* m_debounceEdit = nullptr;
     QCheckBox* m_autoSuggestionsCheck = nullptr;
+    QComboBox* m_styleCombo = nullptr;
+    // Схема темы, с которой открыт диалог (цвета статуса Test Model).
+    Theme::Scheme m_scheme = Theme::Scheme::Ptuch;
     QPushButton* m_testButton = nullptr;
     QLabel* m_testStatusLabel = nullptr;
 

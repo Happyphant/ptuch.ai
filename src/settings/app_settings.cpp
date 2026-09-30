@@ -28,6 +28,7 @@ AppSettings AppSettings::load()
     value.autoSuggestions =
         settings.value(keyAutoSuggestions, value.autoSuggestions)
             .toBool();
+    value.style = settings.value(keyStyle, value.style).toString();
 
     value.sanitize();
     return value;
@@ -50,6 +51,7 @@ void AppSettings::save() const
     settings.setValue(keyGpuLayers, value.gpuLayers);
     settings.setValue(keyDebounceMs, value.debounceMs);
     settings.setValue(keyAutoSuggestions, value.autoSuggestions);
+    settings.setValue(keyStyle, value.style);
     // Гарантия записи до возврата — настройки переживут перезапуск
     // даже при аварийном завершении процесса.
     settings.sync();
@@ -63,4 +65,11 @@ void AppSettings::sanitize()
     topP = qBound(topPMin, topP, topPMax);
     gpuLayers = qBound(gpuLayersMin, gpuLayers, gpuLayersMax);
     debounceMs = qBound(debounceMin, debounceMs, debounceMax);
+
+    // Схема темы: правленый/мусорный id -> дефолт ПТЮЧ
+    // (те же id, что Theme::schemeFromId).
+    if (style != QLatin1String(styleSystem) &&
+        style != QLatin1String(stylePtuch) &&
+        style != QLatin1String(styleLight))
+        style = QLatin1String(stylePtuch);
 }

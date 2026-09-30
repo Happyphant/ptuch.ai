@@ -108,8 +108,21 @@ void SuggestionOverlay::paintEvent(QPaintEvent* event)
     const int right = width() - margin;
     const qreal lineStep = fm.lineSpacing();
 
+    // Непрозрачный фон под ghost-строкой: цвет Base viewport'а — тот же,
+    // что Qt рисует под текстом документа (viewport с autoFillBackground
+    // заливает палитрную роль Base). Текст документа под подсказкой
+    // закрывается — призрак читается даже посреди строки.
+    const QColor rowBackground =
+        m_editor->viewport()->palette().color(QPalette::Base);
+
     const auto drawRow = [&](const QString& text, qreal rowX,
                              qreal rowY) {
+        // Фон ровно под текстом строки (ширина глифов, не до правого
+        // края): хвост документа после подсказки остаётся виден.
+        const qreal bgWidth =
+            qMin(qreal(fm.horizontalAdvance(text)), right - rowX);
+        painter.fillRect(QRectF(rowX, rowY, bgWidth, fm.height()),
+                         rowBackground);
         painter.drawText(QRectF(QPointF(rowX, rowY),
                                 QSizeF(right - rowX, fm.height())),
                          Qt::AlignLeft | Qt::AlignTop, text);
@@ -176,4 +189,20 @@ bool SuggestionOverlay::eventFilter(QObject* watched, QEvent* event)
         update();
     }
     return QWidget::eventFilter(watched, event);
+}
+
+void SuggestionOverlay::moveEvent(QMoveEvent* event)
+{
+    QWidget::moveEvent(event);
+
+    // QPlainTextEdit прокручивает контент через QWidget::scroll(), а тот
+    // сдвигает дочерних viewport'а (QWidgetPrivate::scrollChildren +
+    // QMoveEvent) — геометрия overlay уезжает из-под курсора, и ghost
+    // рисуется мимо строки. Возвращаем overlay на весь viewport; повторный
+    // Move от setGeometry рекурсии не даёт: геометрия уже совпадает.
+    if (m_editor != nullptr
+        && geometry() != m_editor->viewport()->rect()) {
+        setGeometry(m_editor->viewport()->rect());
+        update();
+    }
 }

@@ -37,6 +37,11 @@ void MockTextGenerationBackend::setSimulateError(bool enabled)
     m_simulateError = enabled;
 }
 
+void MockTextGenerationBackend::setResultText(const QString& text)
+{
+    m_resultText = text;
+}
+
 void MockTextGenerationBackend::setIgnoreCancel(bool enabled)
 {
     m_ignoreCancel = enabled;
@@ -44,6 +49,19 @@ void MockTextGenerationBackend::setIgnoreCancel(bool enabled)
 
 void MockTextGenerationBackend::generate(const GenerationRequest& request)
 {
+    // Адаптеры (LoRA) не поддерживаются: явный отказ вместо тихого
+    // игнора (никакой фиктивной загрузки). Контракт интерфейса — см.
+    // ITextGenerationBackend::generate; см. README «Стили и LoRA-адаптеры».
+    if (!request.adapter.isEmpty()) {
+        emit generationError(
+            request.requestId,
+            QStringLiteral("Mock: бэкенд не поддерживает адаптеры "
+                           "(adapterPath=%1) — стиль применяется через "
+                           "prompt")
+                .arg(request.adapter.path));
+        return;
+    }
+
     // Вызов может прийти из UI-потока: переносим работу в поток объекта.
     QMetaObject::invokeMethod(
         this,
@@ -106,7 +124,11 @@ void MockTextGenerationBackend::finish(GenerationRequest request,
 
     GenerationResult result;
     result.requestId = request.requestId;
-    result.generatedText = makeTestSuggestion(request.context);
+    // Детерминированный результат (setResultText) или автоподсказка
+    // по контексту — как и раньше.
+    result.generatedText = m_resultText.isEmpty()
+        ? makeTestSuggestion(request.context)
+        : m_resultText;
     result.stopReason =
         cancelled ? QStringLiteral("cancelled") : QStringLiteral("stop");
     result.elapsedMs = elapsedMs;
